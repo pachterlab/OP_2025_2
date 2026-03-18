@@ -1,0 +1,20 @@
+[package]
+name = "accumap_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "accumap_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3  = { version = "0.21", features = ["extension-module"] }
+numpy = "0.21"
+ndarray = "0.15"
+rayon = "1"
+rand  = "0.8"
+
+[profile.release]
+opt-level    = 3
+lto          = true
+codegen-units = 1
