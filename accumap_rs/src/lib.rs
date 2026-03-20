@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2};
+use ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -309,48 +309,55 @@ fn get_error<'py>(
     let n = b.nrows();
 
     let error: Array1<f64> = py.allow_threads(|| {
-        // Upper-triangle pairwise distances, then mirror
-        let mut dist = Array2::<f64>::zeros((n, n));
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let dx = b[[i, 0]] - b[[j, 0]];
-                let dy = b[[i, 1]] - b[[j, 1]];
-                let d  = (dx * dx + dy * dy).sqrt();
-                dist[[i, j]] = d;
-                dist[[j, i]] = d;
-            }
-        }
+        // Flatten coordinates for unit-stride inner-loop access
+        let bx: Vec<f64> = (0..n).map(|i| b[[i, 0]]).collect();
+        let by: Vec<f64> = (0..n).map(|i| b[[i, 1]]).collect();
 
-        // Apply count filter
+        // Compute distance matrix rows in parallel
+        let mut dist_rows: Vec<Vec<f64>> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                (0..n).map(|j| {
+                    let dx = bx[i] - bx[j];
+                    let dy = by[i] - by[j];
+                    (dx * dx + dy * dy).sqrt()
+                }).collect()
+            })
+            .collect();
+
+        // Apply count filter (sequential; cheap compared to distance computation)
         if let (Some(fc), Some(cnt)) = (filter_counts, &counts_owned) {
             for i in 0..n {
                 for j in 0..n {
                     if cnt[[i, j]] <= fc {
-                        dist[[i, j]] = 0.0;
-                        truth[[i, j]] = 0.0;
+                        dist_rows[i][j] = 0.0;
+                        truth[[i, j]]   = 0.0;
                     }
                 }
             }
         }
 
         // OLS-optimal scale: α* = Σ(truth·dist) / Σ(dist²)  (off-diagonal only)
-        let mut num = 0.0_f64;
-        let mut den = 0.0_f64;
-        for i in 0..n {
-            for j in 0..n {
-                if i != j {
-                    num += truth[[i, j]] * dist[[i, j]];
-                    den += dist[[i, j]] * dist[[i, j]];
-                }
-            }
-        }
+        let (num, den): (f64, f64) = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let row = &dist_rows[i];
+                (0..n)
+                    .filter(|&j| i != j)
+                    .fold((0.0_f64, 0.0_f64), |(acc_n, acc_d), j| {
+                        let d = row[j];
+                        (acc_n + truth[[i, j]] * d, acc_d + d * d)
+                    })
+            })
+            .reduce(|| (0.0, 0.0), |(n1, d1), (n2, d2)| (n1 + n2, d1 + d2));
         let scaler = if den > 0.0 { num / den } else { 1.0 };
 
-        // Per-column MSE
+        // Parallel per-column MSE
         (0..n)
+            .into_par_iter()
             .map(|j| {
                 (0..n)
-                    .map(|i| (truth[[i, j]] - dist[[i, j]] * scaler).powi(2))
+                    .map(|i| (truth[[i, j]] - dist_rows[i][j] * scaler).powi(2))
                     .sum::<f64>()
                     / n as f64
             })
@@ -359,118 +366,6 @@ fn get_error<'py>(
     });
 
     Ok(error.into_pyarray_bound(py))
-}
-
-// ============================================================
-// SMACOF  (uniform weights, Rayon-parallel Guttman transform)
-// ============================================================
-
-fn smacof_internal(
-    delta: &Array2<f64>,
-    init:  &Array2<f64>,
-    n_iter: usize,
-    tol:    f64,
-    verbose_step: usize,
-) -> Array2<f64> {
-    let n = delta.nrows();
-    let mut x = init.clone();
-
-    // Centre initial coordinates
-    let mean0 = x.mean_axis(ndarray::Axis(0)).unwrap();
-    for mut row in x.rows_mut() { row -= &mean0; }
-
-    let mut old_stress = f64::INFINITY;
-
-    for it in 0..n_iter {
-        // Parallel pass: each row i computes
-        //   • its upper-triangle contribution to stress
-        //   • (B·X)_i = Σ_{j≠i} (delta_ij/d_ij) · (X_i − X_j)
-        let row_results: Vec<([f64; 2], f64)> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mut bx_i = [0.0_f64; 2];
-                let mut stress_i = 0.0_f64;
-                for j in 0..n {
-                    if i == j { continue; }
-                    let dx = x[[i, 0]] - x[[j, 0]];
-                    let dy = x[[i, 1]] - x[[j, 1]];
-                    let d  = (dx * dx + dy * dy).sqrt();
-                    // Stress: upper-triangle only (avoid double-counting)
-                    if i < j {
-                        let r = delta[[i, j]] - d;
-                        stress_i += r * r;
-                    }
-                    // Guttman: (B·X)_i = Σ ratio_ij · (X_i − X_j)
-                    if d > 1e-10 {
-                        let ratio = delta[[i, j]] / d;
-                        bx_i[0] += ratio * dx;
-                        bx_i[1] += ratio * dy;
-                    }
-                }
-                (bx_i, stress_i)
-            })
-            .collect();
-
-        let stress: f64 = row_results.iter().map(|(_, s)| s).sum();
-
-        if verbose_step > 0 && it % verbose_step == 0 {
-            eprintln!("SMACOF iter {it}: stress = {stress:.6e}");
-        }
-
-        let rel = (old_stress - stress).abs() / (old_stress + 1e-15);
-        if it > 0 && rel < tol {
-            if verbose_step > 0 { eprintln!("SMACOF converged at iter {it}"); }
-            break;
-        }
-        old_stress = stress;
-
-        // X_new = (1/n) · B · X  (centering preserved by zero row/col sums of B)
-        let inv_n = 1.0 / n as f64;
-        let mut x_new = Array2::<f64>::zeros((n, 2));
-        for (i, (bx_i, _)) in row_results.iter().enumerate() {
-            x_new[[i, 0]] = bx_i[0] * inv_n;
-            x_new[[i, 1]] = bx_i[1] * inv_n;
-        }
-        x = x_new;
-    }
-    x
-}
-
-/// Python-exposed SMACOF.  Uniform weights only (use Python path for weighted).
-#[pyfunction]
-#[pyo3(signature = (truth_arr, init, n_iter=300, tol=1e-4, weight_arr=None, filter_counts=0.0, verbose_step=0))]
-fn smacof<'py>(
-    py: Python<'py>,
-    truth_arr:    PyReadonlyArray2<f64>,
-    init:         PyReadonlyArray2<f64>,
-    n_iter:       usize,
-    tol:          f64,
-    weight_arr:   Option<PyReadonlyArray2<f64>>,
-    filter_counts: f64,
-    verbose_step: usize,
-) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    let delta = truth_arr.as_array().to_owned();
-    let init_arr = init.as_array().to_owned();
-    let weight = weight_arr.map(|w| w.as_array().to_owned());
-
-    let result = py.allow_threads(|| {
-        if let Some(w) = weight {
-            // Weighted: fall back to Python-compatible weighted SMACOF
-            // Build effective delta: zero out filtered pairs (reuse smacof_internal
-            // with pre-scaled delta rows is the simplest approach here)
-            let mut wd = delta.clone();
-            for i in 0..delta.nrows() {
-                for j in 0..delta.ncols() {
-                    if w[[i, j]] <= filter_counts { wd[[i, j]] = 0.0; }
-                }
-            }
-            smacof_internal(&wd, &init_arr, n_iter, tol, verbose_step)
-        } else {
-            smacof_internal(&delta, &init_arr, n_iter, tol, verbose_step)
-        }
-    });
-
-    Ok(result.into_pyarray_bound(py))
 }
 
 // ============================================================
@@ -594,7 +489,6 @@ fn return_corrected_array<'py>(
 #[pymodule]
 fn accumap_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_error, m)?)?;
-    m.add_function(wrap_pyfunction!(smacof, m)?)?;
     m.add_function(wrap_pyfunction!(return_corrected_array, m)?)?;
     Ok(())
 }

@@ -3,9 +3,7 @@ import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import shared_memory
 from scipy.optimize import minimize
-from scipy.linalg import cho_factor, cho_solve
 import uuid
-from scipy.spatial import procrustes
 import pandas as pd
 
 try:
@@ -15,148 +13,6 @@ except ImportError:
     _RUST_AVAILABLE = False
 
 
-# ============================================================
-# Classical MDS initialisation (Torgerson scaling)
-# ============================================================
-
-def classical_mds_init(truth_arr):
-    """
-    Return 2-D coordinates via classical MDS (Torgerson scaling).
-
-    Gives a closed-form near-optimal starting point for SMACOF in O(N³)
-    via eigendecomposition of the double-centred squared-distance matrix.
-
-    Parameters
-    ----------
-    truth_arr : np.ndarray (N, N)
-        Symmetric matrix of target pairwise distances.
-
-    Returns
-    -------
-    X : np.ndarray (N, 2)
-        Initial coordinates.
-    """
-    n = len(truth_arr)
-    D2 = truth_arr.astype(np.float64) ** 2
-    H = np.eye(n) - np.ones((n, n)) / n          # centering matrix
-    B = -0.5 * H @ D2 @ H
-    B = (B + B.T) / 2                             # enforce symmetry
-
-    vals, vecs = np.linalg.eigh(B)
-    # Top-2 eigenpairs (eigh returns ascending order)
-    idx = np.argsort(vals)[::-1][:2]
-    X = vecs[:, idx] * np.sqrt(np.maximum(vals[idx], 0.0))
-    return X
-
-
-# ============================================================
-# SMACOF – Scaling by MAjorizing a COmplicated Function
-# ============================================================
-
-def smacof(truth_arr, init=None, n_iter=300, tol=1e-4,
-           weight_arr=None, filter_counts=0, verbose_step=0):
-    """
-    Metric MDS via the SMACOF algorithm.
-
-    Minimises stress = Σ w_ij (delta_ij − d_ij(X))² using the
-    guaranteed-monotone Guttman-transform update.  Converges in far
-    fewer iterations than per-point Powell optimisation.
-
-    For uniform weights the update is a single matrix multiply:
-        X_new = (1/n) · B(X) · X
-    For non-uniform weights a pre-factored Cholesky solve is used.
-
-    Parameters
-    ----------
-    truth_arr    : (N, N) target distances.
-    init         : (N, 2) starting coordinates; classical MDS if None.
-    n_iter       : maximum iterations.
-    tol          : relative stress-change convergence threshold.
-    weight_arr   : (N, N) non-negative weights (uniform 1 if None).
-    filter_counts: set w_ij = 0 where weight_arr[i,j] <= filter_counts.
-    verbose_step : print stress every this many iterations (0 = silent).
-
-    Returns
-    -------
-    X : (N, 2) optimised coordinates.
-    """
-    n = truth_arr.shape[0]
-    delta = truth_arr.astype(np.float64, copy=True)
-    np.fill_diagonal(delta, 0.0)
-
-    # --- Weight matrix ---
-    if weight_arr is not None:
-        W = np.where(weight_arr > filter_counts,
-                     weight_arr.astype(np.float64), 0.0)
-        np.fill_diagonal(W, 0.0)
-        uniform = False
-    else:
-        uniform = True
-
-    # For non-uniform weights pre-factorise V (weighted Laplacian).
-    # V_ii = Σ_j w_ij,  V_ij = −w_ij  (i≠j).
-    # Adding (1/n)·J makes V invertible; the solution gives V⁺·rhs
-    # when rhs is centred (which B·X always is).
-    if not uniform:
-        row_sums = W.sum(axis=1)
-        V = np.diag(row_sums) - W
-        V_reg = V + 1.0 / n
-        V_cho = cho_factor(V_reg)
-
-    # --- Initialise ---
-    if init is None:
-        X = classical_mds_init(truth_arr)
-    else:
-        X = init.astype(np.float64, copy=True)
-    X -= X.mean(axis=0)
-
-    old_stress = np.inf
-
-    for it in range(n_iter):
-        # Pairwise distances  (exploit symmetry: compute upper triangle)
-        diff = X[:, np.newaxis, :] - X[np.newaxis, :, :]   # N×N×2
-        dist = np.sqrt(np.sum(diff ** 2, axis=-1))          # N×N
-
-        # Stress (upper triangle × 2 = full symmetric sum, divide by 2)
-        if uniform:
-            stress = 0.5 * np.sum((delta - dist) ** 2)
-        else:
-            stress = 0.5 * np.sum(W * (delta - dist) ** 2)
-
-        if verbose_step > 0 and it % verbose_step == 0:
-            print(f"SMACOF iter {it}: stress = {stress:.6g}")
-
-        rel_change = abs(old_stress - stress) / (old_stress + 1e-15)
-        if it > 0 and rel_change < tol:
-            if verbose_step > 0:
-                print(f"SMACOF converged at iter {it}: stress = {stress:.6g}")
-            break
-        old_stress = stress
-
-        # --- Guttman transform ---
-        # ratio_ij = w_ij · delta_ij / d_ij  (0 when d_ij ≈ 0)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            if uniform:
-                ratio = np.where(dist > 1e-10, delta / dist, 0.0)
-            else:
-                ratio = np.where(dist > 1e-10, W * delta / dist, 0.0)
-        np.fill_diagonal(ratio, 0.0)
-
-        # B_ij = −ratio_ij (i≠j),  B_ii = Σ_{j≠i} ratio_ij
-        # Equivalently: (B·X)_i = Σ_j ratio_ij · (X_i − X_j)
-        #   = diag(ratio.sum(1))·X − ratio·X
-        b_diag = ratio.sum(axis=1)
-        BX = b_diag[:, None] * X - ratio @ X
-
-        if uniform:
-            # X_new = (1/n)·B·X  (centering preserved automatically)
-            X = BX / n
-        else:
-            # X_new = V⁺·B·X  via Cholesky solve
-            X = cho_solve(V_cho, BX)
-            X -= X.mean(axis=0)
-
-    return X
 
 
 # ============================================================
@@ -374,16 +230,16 @@ def get_error(b_arr, truth_arr, filter_counts=None, counts=None):
 
 
 # ============================================================
-# correct_locations  (SMACOF default, Powell fallback)
+# correct_locations
 # ============================================================
 
 def correct_locations(b_df, truth, weight=None,
                       filter_counts=0, n_jobs=None,
                       verbose_step=100, update_interval=None,
-                      correct_order='random',
-                      method='smacof', n_iter=300, tol=1e-4):
+                      correct_order='random', gauss_seidel=True):
     """
-    Fit 2-D coordinates to a target distance matrix.
+    Fit 2-D coordinates to a target distance matrix using per-point
+    L-BFGS optimisation (Powell path).
 
     Parameters
     ----------
@@ -391,47 +247,33 @@ def correct_locations(b_df, truth, weight=None,
     truth         : (N, N) target pairwise distances.
     weight        : (N, N) optional weights.
     filter_counts : exclude pairs with weight <= filter_counts.
-    method        : 'smacof' (default) | 'powell'.
-                    'smacof' uses the SMACOF algorithm (much faster for large N).
-                    'powell' uses the legacy per-point Powell optimisation.
-    n_iter        : max iterations (smacof only).
-    tol           : convergence threshold (smacof only).
-    n_jobs        : parallel workers (powell only).
-    correct_order : 'random' | 'sorted' (powell only).
+    n_jobs        : parallel workers (ignored when Rust extension is available).
+    correct_order : 'random' | 'sorted' — 'sorted' processes highest-error
+                    points first, which propagates fixes to neighbours faster.
+    gauss_seidel  : if True (default), each point's update is immediately
+                    visible to subsequent points in the same pass, matching
+                    the original update_interval=1 behaviour.  Set False for
+                    fully parallel updates (faster, lower quality).
+    update_interval: update interval for the Python fallback path.
     """
-    b_array    = np.asarray(b_df.values, dtype=np.float64)
+    b_array     = np.asarray(b_df.values, dtype=np.float64)
     truth_array = np.asarray(truth, dtype=np.float64)
 
-    if method == 'smacof':
-        if _RUST_AVAILABLE:
-            w = np.asarray(weight, dtype=np.float64) if weight is not None else None
-            fit_b_array = _rs.smacof(
-                truth_array, b_array, n_iter, tol, w,
-                float(filter_counts), verbose_step,
-            )
-        else:
-            fit_b_array = smacof(
-                truth_array, init=b_array,
-                n_iter=n_iter, tol=tol,
-                weight_arr=weight, filter_counts=filter_counts,
-                verbose_step=verbose_step,
-            )
+    starting_error = get_error(b_array, truth_array)
+    if _RUST_AVAILABLE:
+        fit_b_array = _rs.return_corrected_array(
+            np.asarray(starting_error, dtype=np.float64),
+            truth_array, b_array, correct_order,
+            np.asarray(weight, dtype=np.float64) if weight is not None else None,
+            float(filter_counts), n_jobs, verbose_step, update_interval,
+            gauss_seidel,
+        )
     else:
-        # Legacy Powell path
-        starting_error = get_error(b_array, truth_array)
-        if _RUST_AVAILABLE:
-            fit_b_array = _rs.return_corrected_array(
-                np.asarray(starting_error, dtype=np.float64),
-                truth_array, b_array, correct_order,
-                np.asarray(weight, dtype=np.float64) if weight is not None else None,
-                float(filter_counts), n_jobs, verbose_step, update_interval,
-            )
-        else:
-            fit_b_array = return_corrected_array(
-                starting_error, truth_array, b_array,
-                correct_order=correct_order, update_interval=update_interval,
-                weight_arr=weight, n_jobs=n_jobs, filter_counts=filter_counts,
-                verbose_step=verbose_step,
-            )
+        fit_b_array = return_corrected_array(
+            starting_error, truth_array, b_array,
+            correct_order=correct_order, update_interval=update_interval,
+            weight_arr=weight, n_jobs=n_jobs, filter_counts=filter_counts,
+            verbose_step=verbose_step,
+        )
 
     return pd.DataFrame(fit_b_array, index=b_df.index, columns=b_df.columns)
