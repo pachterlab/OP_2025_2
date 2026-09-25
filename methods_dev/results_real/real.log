@@ -1,0 +1,70 @@
+=== c58_8 ===
+  C (12030, 12786)  UMI/bead 2498
+  UMAP ...
+/home/coakes/miniconda3/envs/accumap_fig/lib/python3.11/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+  accumap (perfect) ...
+  accumap (fitted, imaging calib) ...
+/home/coakes/accumap_fig_test/OP_2025_2/methods_dev/run_benchmark.py:49: RuntimeWarning: invalid value encountered in log
+  return D - C * np.log(-(A + B - x) / (A - x))
+  Route 2 (UMAP init) ...
+  route2 iter 0: scale=0.443 stress=0.7492
+  route2 iter 1: scale=1.19 stress=0.846
+  route2 iter 2: scale=1.12 stress=0.8438
+  route2 iter 3: scale=1.11 stress=0.8315
+  route2 iter 4: scale=1.12 stress=0.8271
+  route2 iter 5: scale=1.13 stress=0.8259
+  Variant 1 (UMAP init) ...
+  variant1 warmup done: nll=5.4394 alpha=2.53e+05 beta=130
+  variant1 step 1000: nll=5.3397
+  variant1 step 2000: nll=5.3397
+  variant1 step 3000: nll=5.3397
+  Variant 1 (cMDS init) ...
+  variant1 warmup done: nll=5.5131 alpha=1.33e+04 beta=0.0546
+  variant1 step 1000: nll=5.3385
+  variant1 step 2000: nll=5.3384
+  variant1 step 3000: nll=nan
+  Route 1 (oracle imaging senders) ...
+  route1 outer 0: nll(afterX)=87035.562500 nll(afterU)=87035.562500
+  route1 outer 1: nll(afterX)=66429.250000 nll(afterU)=66429.250000
+  route1 outer 2: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 3: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 4: nll(afterX)=66429.234375 nll(afterU)=66429.234375
+  route1 outer 5: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 6: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 7: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 8: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 9: nll(afterX)=66429.234375 nll(afterU)=66429.234375
+    UMAP                   meanMSE=   1679.2 J@10=0.307 beatsUMAP=0.000
+    accumap (perfect)      meanMSE=     79.2 J@10=0.061 beatsUMAP=1.000
+    accumap (fitted)       meanMSE=  38664.9 J@10=0.871 beatsUMAP=0.000
+    Route 2 (UMAP init)    meanMSE=  63316.3 J@10=0.953 beatsUMAP=0.000
+    Variant 1 (UMAP init)  meanMSE= 103380.4 J@10=0.900 beatsUMAP=0.000
+Traceback (most recent call last):
+  File "/home/coakes/accumap_fig_test/OP_2025_2/methods_dev/run_real.py", line 91, in <module>
+    allrows += run_rep(r)
+               ^^^^^^^^^^
+  File "/home/coakes/accumap_fig_test/OP_2025_2/methods_dev/run_real.py", line 72, in run_rep
+    row, jac = summary(name, E, X_true, umap_mse=umap_mse)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/coakes/accumap_fig_test/OP_2025_2/methods_dev/common.py", line 105, in summary
+    mse = per_bead_mse(recon, truth)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/coakes/accumap_fig_test/OP_2025_2/methods_dev/common.py", line 80, in per_bead_mse
+    a = procrustes_align(recon, truth)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/coakes/accumap_fig_test/OP_2025_2/methods_dev/common.py", line 71, in procrustes_align
+    _, m2, _ = procrustes(truth, recon)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/coakes/miniconda3/envs/accumap_fig/lib/python3.11/site-packages/scipy/spatial/_procrustes.py", line 125, in procrustes
+    R, s = orthogonal_procrustes(mtx1, mtx2)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/coakes/miniconda3/envs/accumap_fig/lib/python3.11/site-packages/scipy/_lib/_util.py", line 1226, in wrapper
+    return f(*arrays, *other_args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/coakes/miniconda3/envs/accumap_fig/lib/python3.11/site-packages/scipy/linalg/_procrustes.py", line 99, in orthogonal_procrustes
+    B = np.asarray_chkfinite(B)
+        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/coakes/miniconda3/envs/accumap_fig/lib/python3.11/site-packages/numpy/lib/_function_base_impl.py", line 673, in asarray_chkfinite
+    raise ValueError(
+ValueError: array must not contain infs or NaNs

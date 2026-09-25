@@ -31,3 +31,7 @@ data/*.csv
 data/*.csv.gz
 data/*.tsv
 data/*.parquet
+data/*.h5ad
+
+# Regenerable model checkpoints / derived outputs (large, reproducible from source + fixed seeds)
+analysis_scripts/cerebellum_tutorial_outputs*/

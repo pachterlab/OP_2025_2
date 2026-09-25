@@ -1,0 +1,20 @@
+c58_8: C (12030, 12786)
+init: cached UMAP
+  route1 outer 0: nll(afterX)=71916.945312 nll(afterU)=71916.945312
+  route1 outer 1: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 2: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 3: nll(afterX)=66429.234375 nll(afterU)=66429.234375
+  route1 outer 4: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 5: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 6: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 7: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 8: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 9: nll(afterX)=66429.234375 nll(afterU)=66429.234375
+  route1 outer 10: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 11: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 12: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 13: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+  route1 outer 14: nll(afterX)=66429.226562 nll(afterU)=66429.226562
+
+RESULT: {'method': 'Route1 oracle-U (real)', 'mse_mean': 3604.91, 'mse_median': 2351.605, 'mse_max': 1042640.628, 'jaccard_10': 0.64, 'jaccard_meanX': 0.637, 'frac_beats_umap': 0.103}
+jaccard curve: {1: 0.83, 2: 0.804, 3: 0.773, 4: 0.746, 5: 0.723, 6: 0.702, 7: 0.683, 8: 0.667, 9: 0.653, 10: 0.64, 11: 0.628, 12: 0.617, 13: 0.606, 14: 0.596, 15: 0.586, 16: 0.578, 17: 0.569, 18: 0.562, 19: 0.554, 20: 0.547, 21: 0.539, 22: 0.532, 23: 0.526}
