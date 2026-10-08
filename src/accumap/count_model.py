@@ -1340,6 +1340,90 @@ ANNEAL = 0.0     # warp levels use the kernel blurred by a Gaussian of sd ANNEAL
 KERNEL_V = None  # knot values of the fitted kernel (needed to build blurred tables)
 
 
+WARP_COMPILE = True    # compile the whole warp-step objective (CUDA, distinct senders/receivers, disc footprint):
+                       # ~7% faster per fresh run and ~22% for later runs in a session once PyTorch's on-disk
+                       # compile cache is warm; the first run on a machine pays ~15 s of compilation
+
+
+def _mesh_apply(P, w, lo, h, nx, ny, khat, Q):
+    """Spread weights w at points P onto a mesh (bilinear), convolve with a kernel image (FFT) and sample at Q;
+    functional form of _Mesh.spread / convolve / sample."""
+    torch = _torch()
+    f = (P - lo) / h
+    fx = f[:, 0].clamp(0, nx - 1.001); fy = f[:, 1].clamp(0, ny - 1.001)
+    x0, y0 = fx.floor().long(), fy.floor().long()
+    tx, ty = fx - x0, fy - y0
+    g = torch.zeros(nx * ny, device=P.device, dtype=w.dtype)
+    for ax, ay, wt in ((0, 0, (1 - tx) * (1 - ty)), (1, 0, tx * (1 - ty)), (0, 1, (1 - tx) * ty), (1, 1, tx * ty)):
+        g = g.index_add(0, (x0 + ax) * ny + (y0 + ay), w * wt)
+    G = torch.zeros(2 * nx, 2 * ny, device=P.device, dtype=w.dtype)
+    G[:nx, :ny] = g.reshape(nx, ny)
+    F = torch.fft.irfft2(torch.fft.rfft2(G) * khat, s=(2 * nx, 2 * ny))[:nx, :ny]
+    f = (Q - lo) / h
+    fx = f[:, 0].clamp(0, nx - 1.001); fy = f[:, 1].clamp(0, ny - 1.001)
+    x0, y0 = fx.floor().long(), fy.floor().long()
+    tx, ty = fx - x0, fy - y0
+    return ((1 - tx) * (1 - ty) * F[x0, y0] + tx * (1 - ty) * F[x0 + 1, y0]
+            + (1 - tx) * ty * F[x0, y0 + 1] + tx * ty * F[x0 + 1, y0 + 1])
+
+
+def _warp_objective(D, X0, U0, lo, hi, q, a, near, far, rows, cols, vals, tab, ct, shared, phi, lam, dens, iso):
+    """The warp-step objective (minimized): -loglik / phi + lam * density penalty (+ isotropy penalty), as one
+    function of the displacement-field control values D. near = (nb, no); far = (lo, h, nx, ny, khat) of the
+    far-field mesh; dens = [(G, lo, h, nx, ny, khat)] per bandwidth; iso = (ri, oi, weight, [(w, W)]) or None."""
+    torch = _torch()
+
+    def warp(P):
+        g = 2 * (P - lo) / (hi - lo) - 1
+        return torch.nn.functional.grid_sample(D, g[None, None], mode="bicubic", align_corners=True)[0, :, 0, :].T
+
+    X = X0 + warp(X0)
+    U = X if shared else U0 + warp(U0)
+    ea = torch.exp(a)
+    nb, no = near
+    s = (_near_sum_eager(X, U, nb, no, ea, tab, ct, X.shape[0]) + _mesh_apply(U, ea, *far, X)
+         + ct * (ea.sum() - (ea if shared else 0.0)))
+    loss = (torch.exp(q) * s).sum()
+    for j in range(0, vals.shape[0], NNZ_CHUNK):
+        loss = loss - _obs_term_eager(X, U, rows[j:j + NNZ_CHUNK], cols[j:j + NNZ_CHUNK], vals[j:j + NNZ_CHUNK], tab, ct)
+    total = loss / phi
+    P = X if shared else torch.cat([X, U])
+    pen = 0.0
+    ones = torch.ones(P.shape[0], device=P.device, dtype=P.dtype)
+    for G, mlo, h, nx, ny, khat in dens:
+        lr = torch.log(_mesh_apply(P, ones, mlo, h, nx, ny, khat, G))
+        pen = pen + ((lr - lr.mean()) ** 2).sum()
+    total = total + lam * pen
+    if iso is not None:
+        ri, oi, weight, wts = iso
+        v = X[ri] - U[oi]
+        u = v / v.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        comp = torch.stack([u[:, 0] ** 2 - u[:, 1] ** 2, 2 * u[:, 0] * u[:, 1]], 1)
+        if ISO_CENTER:
+            comp = comp - comp.mean(0, keepdim=True)
+        pi = 0.0
+        for w, W in wts:
+            A = (w @ comp) / W[:, None]
+            pi = pi + ((A ** 2).sum(1) * W).sum() / W.sum()
+        total = total + weight * pi / len(wts)
+    return total
+
+
+_WARP_OBJ = {}
+
+
+def _warp_objective_compiled():
+    torch = _torch()
+    if "f" not in _WARP_OBJ:
+        try:                                     # cache the backward graph on disk too (PyTorch >= 2.5)
+            import torch._functorch.config as fc
+            fc.enable_autograd_cache = True
+        except Exception:
+            pass
+        _WARP_OBJ["f"] = torch.compile(_warp_objective, dynamic=True)
+    return _WARP_OBJ["f"]
+
+
 def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", verbose=False, t0=None,
                     schedule=None, iso=None):
     torch = _torch()
@@ -1362,7 +1446,31 @@ def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", ver
                 q, a = _ipf_fast(Xc, Uc, fk, cnt, a, IPF_WARM_ITERS)
         warp = _Warp(lo, hi, spacing, dev, init_field=warp)
         opt = torch.optim.Adam([warp.D], lr=lr)
+        compiled = (WARP_COMPILE and dev.type == "cuda" and not cnt.shared and isinstance(footprint, str)
+                    and footprint == "disc" and KDE_FFT and not EDGE_CORRECT and ANNEAL <= 0)
         for it in range(steps):
+            if compiled:
+                opt.zero_grad(set_to_none=True)
+                with torch.no_grad():
+                    Xn = X0 + warp(X0); Un = Xn if cnt.shared else U0 + warp(U0)
+                    if it % DENSITY_REFRESH == 0:
+                        dgeom = _disc_geometry(Xn if cnt.shared else torch.cat([Xn, Un]))
+                        dens = [(G, M.lo, M.h, M.nx, M.ny, M.khat) for G, M in dgeom]
+                    if iso is not None and it % ISO_REFRESH == 0:
+                        iso_w = _iso_weights(0.5 * (Xn[iso["ri"]] + Un[iso["oi"]]), lo, hi, dev)
+                mh = fk.mesh
+                total = _warp_objective_compiled()(
+                    warp.D, X0, U0, lo, hi, q, a, (fk.nb, fk.no), (mh.lo, mh.h, mh.nx, mh.ny, mh.khat),
+                    cnt.rows, cnt.cols, cnt.vals, tab, fk.ct, cnt.shared, float(phi), float(lam), dens,
+                    None if iso is None else (iso["ri"], iso["oi"], float(iso["weight"]), iso_w))
+                total.backward()
+                opt.step()
+                if (it + 1) % 50 == 0:
+                    with torch.no_grad():
+                        X = X0 + warp(X0); U = X if cnt.shared else U0 + warp(U0)
+                        fk = _Fast(X, U, tab, c, cnt.shared)
+                        q, a = _ipf_fast(X, U, fk, cnt, a, IPF_WARM_ITERS)
+                continue
             opt.zero_grad(set_to_none=True)
             _ll_and_grad_fast(X0, U0, warp, cnt, q, a, fk, tab, c)
             if warp.D.grad is not None:
