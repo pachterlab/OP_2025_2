@@ -19,7 +19,7 @@ env/
 .ipynb_checkpoints/
 
 # Rust / Cargo
-accumap_rs/target/
+analysis_scripts/baselines/accumap_rs/target/
 
 # maturin build artifacts
 *.so
@@ -33,5 +33,10 @@ data/*.tsv
 data/*.parquet
 data/*.h5ad
 
-# Regenerable model checkpoints / derived outputs (large, reproducible from source + fixed seeds)
-analysis_scripts/cerebellum_tutorial_outputs*/
+# Local tooling (assistant settings, local conda environment)
+.claude/
+.conda/
+
+# Notebook RECOMPUTE outputs (the shipped cache is analysis_scripts/paper_results/; recomputed results, and the
+# SCOPE simulator the SCOPE notebook downloads, stay local)
+analysis_scripts/paper_results/*_recomputed/

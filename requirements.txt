@@ -5,3 +5,5 @@ scanpy==1.11.5
 scipy==1.16.0
 seaborn==0.13.2
 numpy>=1.26
+umap-learn
+scikit-learn

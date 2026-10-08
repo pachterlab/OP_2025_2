@@ -1,0 +1,50 @@
+{
+ "real c58_8": {
+  "umi": 1514.0,
+  "detected": 279.0,
+  "top1": 0.3096722662448883,
+  "f30": 0.6180703639984131,
+  "far_detected": 154.0,
+  "far_singleton": 0.9583333333333334,
+  "split_receivers": 0.006236487610177948,
+  "links_300": 0.0006596818005432674,
+  "umap_seed0": "recv p50 37.5 p90 69.9 pairRMSE 47.7 J@10 0.351",
+  "umap_seed1": "recv p50 38.4 p90 70.3 pairRMSE 49.0 J@10 0.349"
+ },
+ "calibrated, uniform disc": {
+  "umi": 1560.0,
+  "detected": 295.0,
+  "top1": 0.27812546491622925,
+  "f30": 0.620820164680481,
+  "far_detected": 171.0,
+  "far_singleton": 0.9590543480430314,
+  "split_receivers": 0.005072343256278064,
+  "links_300": 0.0007650091468484949,
+  "umap_seed0": "recv p50 49.5 p90 89.7 pairRMSE 58.4 J@10 0.324",
+  "umap_seed1": "recv p50 54.7 p90 91.4 pairRMSE 61.2 J@10 0.325"
+ },
+ "calibrated, c58_8 positions": {
+  "umi": 1489.0,
+  "detected": 296.0,
+  "top1": 0.2673202157020569,
+  "f30": 0.6074610948562622,
+  "far_detected": 171.0,
+  "far_singleton": 0.9625568306995934,
+  "split_receivers": 0.00432396474305671,
+  "links_300": 0.0009424025722046677,
+  "umap_seed0": "recv p50 23.9 p90 49.1 pairRMSE 45.1 J@10 0.321",
+  "umap_seed1": "recv p50 24.9 p90 50.7 pairRMSE 45.5 J@10 0.318"
+ },
+ "idealized": {
+  "umi": 2500.0,
+  "detected": 152.0,
+  "top1": 0.03468899428844452,
+  "f30": 0.15152694284915924,
+  "far_detected": 0.0,
+  "far_singleton": 0.0,
+  "split_receivers": 0.0,
+  "links_300": 0.0,
+  "umap_seed0": "recv p50 25.5 p90 50.2 pairRMSE 33.5 J@10 0.261",
+  "umap_seed1": "recv p50 29.5 p90 51.8 pairRMSE 34.2 J@10 0.258"
+ }
+}
