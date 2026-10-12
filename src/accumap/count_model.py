@@ -1010,6 +1010,7 @@ class _Mesh:
 def _near_pairs(X, U, shared, radius, chunk=2000):
     """(receiver, sender) index pairs closer than radius (self pairs excluded when shared)."""
     torch = _torch()
+    small = len(X) * len(U) > NEAR_INT32_ABOVE      # very large arrays: int32 indices (half the memory, same values)
     rr, oo = [], []
     for i in range(0, len(X), chunk):
         d = torch.cdist(X[i:i + chunk], U)
@@ -1018,8 +1019,13 @@ def _near_pairs(X, U, shared, radius, chunk=2000):
         if shared:
             k = b != o
             b, o = b[k], o[k]
+        if small:
+            b, o = b.int(), o.int()
         rr.append(b); oo.append(o)
     return torch.cat(rr), torch.cat(oo)
+
+
+NEAR_INT32_ABOVE = 2e9   # receivers x senders above which near-pair indices are int32; every paper dataset is below it
 
 
 class _Fast:
@@ -1119,6 +1125,34 @@ def _kfit_terms_eager(ldz, ldn, sn, v, logk, c, q, ac, ea, rows, cols, vals, nb,
 
 _kfit_terms = _kfit_terms_eager   # compiling this costs more than it saves over 300 steps (measured)
 
+KFIT_CHUNK_ABOVE = 50_000_000   # nonzero + near pairs above which the kernel-fit terms are chunked and checkpointed
+                                # (same values; bounds memory on large arrays). Every paper dataset is below it.
+
+
+def _kfit_obs_chunk(ldz, v, logk, c, q, ac, rows, cols, vals):
+    torch = _torch()
+    return (vals * (q[rows] + ac[cols] + torch.log(torch.exp(_log_kernel_seg(ldz, v, logk)) + c))).sum()
+
+
+def _kfit_near_chunk(ldn, sn, v, logk, ea, no):
+    torch = _torch()
+    return torch.exp(_log_kernel_seg(ldn, v, logk)) * sn * ea[no]
+
+
+def _kfit_terms_chunked(ldz, ldn, sn, v, logk, c, q, ac, ea, rows, cols, vals, nb, no):
+    """As _kfit_terms_eager, in NNZ_CHUNK pieces whose intermediates are recomputed in the backward pass."""
+    torch = _torch()
+    from torch.utils.checkpoint import checkpoint
+    obs = 0.0
+    for j in range(0, len(vals), NNZ_CHUNK):
+        s = slice(j, j + NNZ_CHUNK)
+        obs = obs + checkpoint(_kfit_obs_chunk, ldz[s], v, logk, c, q, ac, rows[s], cols[s], vals[s], use_reentrant=False)
+    near = torch.zeros(q.shape[0], device=q.device, dtype=q.dtype)
+    for j in range(0, len(nb), NNZ_CHUNK):
+        s = slice(j, j + NNZ_CHUNK)
+        near = near.index_add(0, nb[s], checkpoint(_kfit_near_chunk, ldn[s], sn[s], v, logk, ea, no[s], use_reentrant=False))
+    return obs, near
+
 
 def fit_kernel_fast(X, U, cnt, dev, iters=300, lr=0.05, decay=False):
     """Poisson ML fit of the kernel, c, a, q with positions fixed, over ALL receivers and senders:
@@ -1145,10 +1179,11 @@ def fit_kernel_fast(X, U, cnt, dev, iters=300, lr=0.05, decay=False):
     opt = torch.optim.Adam([a, q, w, logc], lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=iters) if decay else None
     norm = float(cnt.n_r) * float(cnt.n_o)
+    terms = _kfit_terms_chunked if len(cnt.vals) + len(nb) > KFIT_CHUNK_ABOVE else _kfit_terms
     for _ in range(iters):
         opt.zero_grad(set_to_none=True)
         v = _knot_values(w); c = torch.exp(logc); ac = a - a.mean(); ea = torch.exp(ac)
-        obs, near = _kfit_terms(ldz, ldn, sn, v, logk, c, q, ac, ea, cnt.rows, cnt.cols, cnt.vals, nb, no)
+        obs, near = terms(ldz, ldn, sn, v, logk, c, q, ac, ea, cnt.rows, cnt.cols, cnt.vals, nb, no)
         mesh.khat = torch.fft.rfft2(torch.exp(_log_kernel_seg(lr_mesh, v, logk)) * s_mesh)
         far = mesh.sample(mesh.convolve(mesh.spread(U, ea)), X)
         bg = c * (ea.sum() - (ea if shared else 0.0))
@@ -1304,7 +1339,26 @@ def isotropy_noise_floor(X, Uo, ri, oi, lo, hi, draws=5, seed=0):
 
 
 def _iso_weights(mid, lo, hi, dev):
-    """Gaussian weights of contact midpoints in the isotropy patches, per scale (no gradient)."""
+    """Gaussian weights of contact midpoints in the isotropy patches, per scale (no gradient). The patches lie on a
+    regular grid and the Gaussian factorizes, w[(ix, iy), j] = Wx[ix, j] * Wy[iy, j], so only the two factors are
+    stored: per scale (Wx, Wy, ok, W) with ok the flattened patches whose total weight W exceeds 20 (W[ok] kept).
+    Same values as the dense patch x contact matrix (_iso_weights_dense) in (nx + ny) x n_contact memory."""
+    torch = _torch()
+    out = []
+    with torch.no_grad():
+        for L in ISO_SCALES:
+            gx = torch.arange(float(lo[0]), float(hi[0]) + L / 2, L / 2, device=dev)
+            gy = torch.arange(float(lo[1]), float(hi[1]) + L / 2, L / 2, device=dev)
+            Wx = torch.exp(-(gx[:, None] - mid[None, :, 0]) ** 2 / (2 * L ** 2))     # (nx, n_contact)
+            Wy = torch.exp(-(gy[:, None] - mid[None, :, 1]) ** 2 / (2 * L ** 2))     # (ny, n_contact)
+            W = (Wx @ Wy.T).reshape(-1)                                            # patch order as meshgrid "ij"
+            ok = W > 20
+            out.append((Wx, Wy, ok, W[ok]))
+    return out
+
+
+def _iso_weights_dense(mid, lo, hi, dev):
+    """The dense patch x contact weights per scale, (w[ok], W[ok]); kept for checking _iso_weights."""
     torch = _torch()
     out = []
     with torch.no_grad():
@@ -1319,12 +1373,24 @@ def _iso_weights(mid, lo, hi, dev):
     return out
 
 
+def _patch_means(comp, wt):
+    """Weighted mean direction components per kept patch, for separable (Wx, Wy, ok, W) or dense (w, W) weights."""
+    torch = _torch()
+    if len(wt) == 4:
+        Wx, Wy, ok, W = wt
+        A = torch.stack([((Wx * comp[:, k]) @ Wy.T).reshape(-1)[ok] for k in range(comp.shape[1])], 1)
+    else:
+        w, W = wt
+        A = w @ comp
+    return A / W[:, None], W
+
+
 def _patch_anisotropy_w(comp, weights):
     if ISO_CENTER:
         comp = comp - comp.mean(0, keepdim=True)
     pen = 0.0
-    for w, W in weights:
-        A = (w @ comp) / W[:, None]
+    for wt in weights:
+        A, W = _patch_means(comp, wt)
         pen = pen + ((A ** 2).sum(1) * W).sum() / W.sum()
     return pen / len(weights)
 
@@ -1402,8 +1468,8 @@ def _warp_objective(D, X0, U0, lo, hi, q, a, near, far, rows, cols, vals, tab, c
         if ISO_CENTER:
             comp = comp - comp.mean(0, keepdim=True)
         pi = 0.0
-        for w, W in wts:
-            A = (w @ comp) / W[:, None]
+        for wt in wts:
+            A, W = _patch_means(comp, wt)
             pi = pi + ((A ** 2).sum(1) * W).sum() / W.sum()
         total = total + weight * pi / len(wts)
     return total
@@ -1956,17 +2022,34 @@ def contact_anisotropy(counts, receivers, senders, array_diameter, device=None):
     return {"penalty": pen, "floor": fl, "ratio": pen / fl, "contacts": int(len(ri))}
 
 
-def umap_layout(counts, seed=0, shared=False, n_epochs=400):
+def umap_layout(counts, seed=0, shared=False, n_epochs=400, fast=False, backend="umap-learn"):
     """UMAP initialization as used in the paper: log(1 + C) (symmetrized C + C^T for shared beads),
-    cosine metric, 25 neighbours, minimum distance 0.99."""
-    import umap
+    cosine metric, 25 neighbours, minimum distance 0.99.
+    fast       for large arrays (only the starting layout changes; accumap still uses every count): pairs with a
+               single count are dropped from UMAP's input (rows left empty keep their counts), 200 epochs, and
+               umap-learn runs multi-threaded without a fixed seed, so starts are not exactly reproducible.
+    backend    "umap-learn" (default, as in the paper) or "cuml" (RAPIDS GPU UMAP; same settings, different
+               implementation, so its layouts differ from umap-learn's)."""
     import scipy.sparse as sp
     C = sp.csr_matrix(counts, dtype=np.float32)
     if shared:
         C = (C + C.T).tocsr()
-    C = C.copy(); C.data = np.log1p(C.data)
-    return umap.UMAP(random_state=seed, metric="cosine", n_neighbors=25, min_dist=0.99, n_components=2,
-                     n_epochs=n_epochs).fit_transform(C).astype(np.float32)
+    C = C.copy()
+    if fast:
+        n_epochs = min(n_epochs, 200)
+        keep = C.copy(); keep.data[keep.data < 2] = 0; keep.eliminate_zeros()
+        empty = np.diff(keep.indptr) == 0
+        if empty.any():
+            keep = (keep + sp.diags(empty.astype(np.float32)) @ C).tocsr()
+        C = keep
+    C.data = np.log1p(C.data)
+    if backend == "cuml":
+        from cuml.manifold import UMAP
+        return np.asarray(UMAP(random_state=None if fast else seed, metric="cosine", n_neighbors=25, min_dist=0.99,
+                               n_components=2, n_epochs=n_epochs).fit_transform(C), dtype=np.float32)
+    import umap
+    return umap.UMAP(random_state=None if fast else seed, metric="cosine", n_neighbors=25, min_dist=0.99,
+                     n_components=2, n_epochs=n_epochs, n_jobs=-1 if fast else 1).fit_transform(C).astype(np.float32)
 
 
 def log_likelihood(counts, receivers, array_diameter, senders=None, shared=False, device=None):
