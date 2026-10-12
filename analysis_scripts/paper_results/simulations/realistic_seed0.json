@@ -1,0 +1,1 @@
+{"umap": "recv p50 49.5 p90 89.7 pairRMSE 58.4 J@10 0.324", "old_full": "recv p50 72.6 p90 232.5 pairRMSE 161.5 J@10 0.875", "old_knn": "recv p50 53.1 p90 93.8 pairRMSE 66.0 J@10 0.376", "new_v1": "recv p50 17.3 p90 31.8 pairRMSE 35.6 J@10 0.267"}

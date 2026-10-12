@@ -1,0 +1,42 @@
+{
+ "0": {
+  "mean_count_to_nearest_neighbor": {
+   "along rows (0 deg)": 29.94700050354004,
+   "diagonal 60 deg": 25.0654296875,
+   "diagonal 120 deg": 25.046228408813477
+  },
+  "anisotropy_at_truth": 0.12125659734010696
+ },
+ "1": {
+  "mean_count_to_nearest_neighbor": {
+   "along rows (0 deg)": 29.945951461791992,
+   "diagonal 60 deg": 25.165781021118164,
+   "diagonal 120 deg": 24.893741607666016
+  },
+  "anisotropy_at_truth": 0.11931533366441727
+ },
+ "2": {
+  "mean_count_to_nearest_neighbor": {
+   "along rows (0 deg)": 29.92983055114746,
+   "diagonal 60 deg": 24.895105361938477,
+   "diagonal 120 deg": 24.86263656616211
+  },
+  "anisotropy_at_truth": 0.12385550886392593
+ },
+ "3": {
+  "mean_count_to_nearest_neighbor": {
+   "along rows (0 deg)": 29.978893280029297,
+   "diagonal 60 deg": 25.021940231323242,
+   "diagonal 120 deg": 24.93988037109375
+  },
+  "anisotropy_at_truth": 0.12123097479343414
+ },
+ "4": {
+  "mean_count_to_nearest_neighbor": {
+   "along rows (0 deg)": 29.989900588989258,
+   "diagonal 60 deg": 25.211933135986328,
+   "diagonal 120 deg": 24.94835662841797
+  },
+  "anisotropy_at_truth": 0.12393856048583984
+ }
+}

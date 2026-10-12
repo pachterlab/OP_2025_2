@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "accumap"
+version = "0.1.0"
+description = "Imaging-free reconstruction of bead positions in diffusion-based, optics-free spatial transcriptomics"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.26",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "umap-learn",
+    "torch",
+    "editdistance",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+accumap = ["data/*.npz"]
