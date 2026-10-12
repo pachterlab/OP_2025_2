@@ -1053,7 +1053,10 @@ class _Fast:
         """s_b = sum_o w_o (K(d_bo) + c), self excluded when shared (differentiable)."""
         torch = _torch()
         near = _near_sum(X, U, self.nb, self.no, w, self.tab, self.ct, len(X))
-        far = self.mesh.sample(self.mesh.convolve(self.mesh.spread(U, w)), X)
+        if WIDTH is not None:
+            fw = _far_w(); far = self.mesh.sample(self.mesh.convolve(self.mesh.spread(U, w * fw)), X) * fw
+        else:
+            far = self.mesh.sample(self.mesh.convolve(self.mesh.spread(U, w)), X)
         bg = self.c * (w.sum() - (w if self.shared else 0.0))
         return near + far + bg
 
@@ -1061,7 +1064,10 @@ class _Fast:
         """t_o = sum_b v_b (K(d_bo) + c)."""
         torch = _torch()
         near = _near_sum(U, X, self.no, self.nb, v, self.tab, self.ct, len(U))
-        far = self.mesh.sample(self.mesh.convolve(self.mesh.spread(X, v)), U)
+        if WIDTH is not None:
+            fw = _far_w(); far = self.mesh.sample(self.mesh.convolve(self.mesh.spread(X, v * fw)), U) * fw
+        else:
+            far = self.mesh.sample(self.mesh.convolve(self.mesh.spread(X, v)), U)
         bg = self.c * (v.sum() - (v if self.shared else 0.0))
         return near + far + bg
 
@@ -1070,17 +1076,34 @@ def _obs_term_eager(X, U, rows, cols, vals, tab, c):
     """sum over nonzero counts of C * log m(d) (the observed part of the Poisson log-likelihood)."""
     torch = _torch()
     d = torch.sqrt(((X[rows] - U[cols]) ** 2).sum(-1) + 1e-4)
+    if WIDTH is not None:
+        d = d / _pair_scale(rows, cols)
     f = (d / TAB_STEP).clamp(0, tab.shape[0] - 1.001)
     i = f.floor().long()
     t = f - i
     return (vals * torch.log(tab[i] * (1 - t) + tab[i + 1] * t + c)).sum()
 
 
+NEAR_CHUNK_ABOVE = 20_000_000   # with WIDTH set: near pairs above which the near sum is chunked + checkpointed (memory)
+
+
 def _near_sum_eager(X, U, nb, no, w, tab, c, n_out):
+    torch = _torch()
+    if WIDTH is not None and len(nb) > NEAR_CHUNK_ABOVE and torch.is_grad_enabled():
+        from torch.utils.checkpoint import checkpoint
+        out = torch.zeros(n_out, device=X.device, dtype=w.dtype)
+        for j in range(0, len(nb), NNZ_CHUNK):
+            out = out + checkpoint(_near_sum_eager_1, X, U, nb[j:j + NNZ_CHUNK], no[j:j + NNZ_CHUNK], w, tab, c, n_out, use_reentrant=False)
+        return out
+    return _near_sum_eager_1(X, U, nb, no, w, tab, c, n_out)
+
+
+def _near_sum_eager_1(X, U, nb, no, w, tab, c, n_out):
     """s_b = sum over near pairs of w_o K(d_bo) (1 - S(d_bo)), as _Fast.near_weight + index_add."""
     torch = _torch()
     d = torch.sqrt(((X[nb] - U[no]) ** 2).sum(-1) + 1e-4)
-    f = (d / TAB_STEP).clamp(0, tab.shape[0] - 1.001)
+    dk = d / _pair_scale(nb, no) if WIDTH is not None else d   # kernel at width-scaled distance; switch at physical distance
+    f = (dk / TAB_STEP).clamp(0, tab.shape[0] - 1.001)
     i = f.floor().long()
     t = f - i
     k = tab[i] * (1 - t) + tab[i + 1] * t                     # K(d) (exp(_logm) - c)
@@ -1125,6 +1148,22 @@ def _kfit_terms_eager(ldz, ldn, sn, v, logk, c, q, ac, ea, rows, cols, vals, nb,
 
 _kfit_terms = _kfit_terms_eager   # compiling this costs more than it saves over 300 steps (measured)
 
+WIDTH = None        # prototype (shared beads only): per-bead transfer width factors s_i (torch tensor on the device); pair
+                    # kernels are evaluated at d / sqrt(s_i s_j). None (default) = one kernel for all pairs (unchanged).
+WIDTH_BETA = 2.0    # far field: K(d/s) ~ s^beta K(d) beyond the near radius (power-law tail)
+JOINT_WIDTH = False # prototype: estimate per-bead log-widths jointly with the warp (shared beads); result in WIDTH_LAM
+JOINT_LR, JOINT_RIDGE, JOINT_SMOOTH = 0.01, 5.0, 500.0   # Adam rate; ridge and smoothness weights in (tempered) count units
+WIDTH_LAM = None    # trainable log-widths (persist across stages; reset to None before a new reconstruction)
+
+
+def _pair_scale(i, j):
+    torch = _torch()
+    return torch.sqrt(WIDTH[i] * WIDTH[j])
+
+
+def _far_w():
+    return WIDTH ** (WIDTH_BETA / 2)
+
 KFIT_CHUNK_ABOVE = 50_000_000   # nonzero + near pairs above which the kernel-fit terms are chunked and checkpointed
                                 # (same values; bounds memory on large arrays). Every paper dataset is below it.
 
@@ -1163,9 +1202,9 @@ def fit_kernel_fast(X, U, cnt, dev, iters=300, lr=0.05, decay=False):
     shared = cnt.shared
     nb, no = _near_pairs(X, U, shared, FAST_R2)
     dn = torch.sqrt(((X[nb] - U[no]) ** 2).sum(-1) + 1e-4)
-    ldn = torch.log(dn.clamp(float(KNOTS[0]), float(KNOTS[-1]))); sn = 1 - _switch(dn)
+    ldn = torch.log((dn / _pair_scale(nb, no) if WIDTH is not None else dn).clamp(float(KNOTS[0]), float(KNOTS[-1]))); sn = 1 - _switch(dn)
     dz = torch.sqrt(((X[cnt.rows] - U[cnt.cols]) ** 2).sum(-1) + 1e-4)
-    ldz = torch.log(dz.clamp(float(KNOTS[0]), float(KNOTS[-1])))
+    ldz = torch.log((dz / _pair_scale(cnt.rows, cnt.cols) if WIDTH is not None else dz).clamp(float(KNOTS[0]), float(KNOTS[-1])))
     P = X if shared else torch.cat([X, U])
     mesh = _Mesh(P.min(0).values - FAST_R2 - 400, P.max(0).values + FAST_R2 + 400, FAST_MESH, None, 0.0, False,
                  dev, fn=lambda r: torch.zeros_like(r))
@@ -1185,7 +1224,8 @@ def fit_kernel_fast(X, U, cnt, dev, iters=300, lr=0.05, decay=False):
         v = _knot_values(w); c = torch.exp(logc); ac = a - a.mean(); ea = torch.exp(ac)
         obs, near = terms(ldz, ldn, sn, v, logk, c, q, ac, ea, cnt.rows, cnt.cols, cnt.vals, nb, no)
         mesh.khat = torch.fft.rfft2(torch.exp(_log_kernel_seg(lr_mesh, v, logk)) * s_mesh)
-        far = mesh.sample(mesh.convolve(mesh.spread(U, ea)), X)
+        far = (mesh.sample(mesh.convolve(mesh.spread(U, ea * _far_w())), X) * _far_w() if WIDTH is not None
+               else mesh.sample(mesh.convolve(mesh.spread(U, ea)), X))
         bg = c * (ea.sum() - (ea if shared else 0.0))
         expct = (torch.exp(q) * (near + far + bg)).sum()
         (-(obs - expct) / norm).backward()
@@ -1207,9 +1247,9 @@ def fit_kernel_nb(X, U, cnt, dev, iters=3000, lr=0.05):
     shared = cnt.shared
     nb, no = _near_pairs(X, U, shared, FAST_R2)
     dn = torch.sqrt(((X[nb] - U[no]) ** 2).sum(-1) + 1e-4)
-    ldn = torch.log(dn.clamp(float(KNOTS[0]), float(KNOTS[-1]))); sn = 1 - _switch(dn)
+    ldn = torch.log((dn / _pair_scale(nb, no) if WIDTH is not None else dn).clamp(float(KNOTS[0]), float(KNOTS[-1]))); sn = 1 - _switch(dn)
     dz = torch.sqrt(((X[cnt.rows] - U[cnt.cols]) ** 2).sum(-1) + 1e-4)
-    ldz = torch.log(dz.clamp(float(KNOTS[0]), float(KNOTS[-1])))
+    ldz = torch.log((dz / _pair_scale(cnt.rows, cnt.cols) if WIDTH is not None else dz).clamp(float(KNOTS[0]), float(KNOTS[-1])))
     P = X if shared else torch.cat([X, U])
     mesh = _Mesh(P.min(0).values - FAST_R2 - 400, P.max(0).values + FAST_R2 + 400, FAST_MESH, None, 0.0, False,
                  dev, fn=lambda r: torch.zeros_like(r))
@@ -1239,7 +1279,8 @@ def fit_kernel_nb(X, U, cnt, dev, iters=3000, lr=0.05):
         zero_near = (-r * torch.log1p(mun / r)).sum()
         mesh.khat = torch.fft.rfft2(torch.exp(_log_kernel_seg(lr_mesh, v, logk)) * s_mesh)
         near_lin = torch.zeros(cnt.n_r, device=dev).index_add(0, nb, Kn * sn * ea[no])
-        far = mesh.sample(mesh.convolve(mesh.spread(U, ea)), X)
+        far = (mesh.sample(mesh.convolve(mesh.spread(U, ea * _far_w())), X) * _far_w() if WIDTH is not None
+               else mesh.sample(mesh.convolve(mesh.spread(U, ea)), X))
         bg = c * (ea.sum() - (ea if shared else 0.0))
         mu_all = (torch.exp(q) * (near_lin + far + bg)).sum()
         mu_near = mun.sum()
@@ -1502,6 +1543,19 @@ def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", ver
         q, a = _ipf_fast(X0, U0, fk, cnt, a, 30)
     warp = None
     tab0 = tab
+    global WIDTH, WIDTH_LAM
+    joint = JOINT_WIDTH and cnt.shared
+    if joint:
+        if WIDTH_LAM is None or WIDTH_LAM.shape[0] != len(X0):
+            WIDTH_LAM = torch.zeros(len(X0), device=dev, requires_grad=True)
+        WIDTH = torch.exp(WIDTH_LAM).detach()
+        with torch.no_grad():                    # contacts for the smoothness penalty: pairs within 3x the median nearest-neighbour distance
+            dd = torch.sqrt(((X0[fk.nb] - X0[fk.no]) ** 2).sum(-1))
+            nn = torch.full((len(X0),), float("inf"), device=dev).scatter_reduce(0, fk.nb, dd, reduce="amin")
+            ck = dd < 3 * nn[torch.isfinite(nn)].median()
+            cb, co = fk.nb[ck], fk.no[ck]
+            cdeg = torch.bincount(cb, minlength=len(X0)).clamp(min=1).float()
+        lopt = torch.optim.Adam([WIDTH_LAM], lr=JOINT_LR)
     for spacing, steps, lr in (schedule or WARP_SCHEDULE):
         if ANNEAL > 0:
             tab = _kernel_table(KERNEL_V, dev, ANNEAL * spacing)
@@ -1538,9 +1592,20 @@ def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", ver
                         q, a = _ipf_fast(X, U, fk, cnt, a, IPF_WARM_ITERS)
                 continue
             opt.zero_grad(set_to_none=True)
+            if joint:
+                lopt.zero_grad(set_to_none=True)
+                WIDTH = torch.exp(WIDTH_LAM)             # widths enter this step's likelihood graph
             _ll_and_grad_fast(X0, U0, warp, cnt, q, a, fk, tab, c)
             if warp.D.grad is not None:
                 warp.D.grad.mul_(1e6 / phi)
+            if joint:
+                WIDTH_LAM.grad.mul_(1e6 / phi)            # same temper as the warp
+                lap = ((WIDTH_LAM[cb] - WIDTH_LAM[co]) ** 2 / cdeg[cb]).sum()
+                ((JOINT_RIDGE * (WIDTH_LAM ** 2).sum() + JOINT_SMOOTH * lap) / phi).backward()
+                lopt.step()
+                with torch.no_grad():
+                    WIDTH_LAM -= WIDTH_LAM.mean()          # only relative widths are identifiable
+                WIDTH = torch.exp(WIDTH_LAM).detach()
             P = X0 + warp(X0) if cnt.shared else torch.cat([X0 + warp(X0), U0 + warp(U0)])
             if not isinstance(footprint, str) and it % 50 == 0:
                 posed = (_pose_polygon(P, footprint),       # footprint pose refreshed every 50 steps
