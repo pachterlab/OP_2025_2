@@ -1089,11 +1089,13 @@ NEAR_CHUNK_ABOVE = 20_000_000   # with WIDTH set: near pairs above which the nea
 
 def _near_sum_eager(X, U, nb, no, w, tab, c, n_out):
     torch = _torch()
-    if WIDTH is not None and len(nb) > NEAR_CHUNK_ABOVE and torch.is_grad_enabled():
+    if WIDTH is not None and len(nb) > NEAR_CHUNK_ABOVE:
         from torch.utils.checkpoint import checkpoint
+        grad = torch.is_grad_enabled()
         out = torch.zeros(n_out, device=X.device, dtype=w.dtype)
         for j in range(0, len(nb), NNZ_CHUNK):
-            out = out + checkpoint(_near_sum_eager_1, X, U, nb[j:j + NNZ_CHUNK], no[j:j + NNZ_CHUNK], w, tab, c, n_out, use_reentrant=False)
+            args = (X, U, nb[j:j + NNZ_CHUNK], no[j:j + NNZ_CHUNK], w, tab, c, n_out)
+            out = out + (checkpoint(_near_sum_eager_1, *args, use_reentrant=False) if grad else _near_sum_eager_1(*args))
         return out
     return _near_sum_eager_1(X, U, nb, no, w, tab, c, n_out)
 
