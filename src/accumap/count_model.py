@@ -881,6 +881,22 @@ def _c2f_grids(W, dev):
             torch.stack(torch.meshgrid(hf, hf, indexing="ij"), -1).reshape(-1, 2))
 
 
+REFINE_IPF_FAST = None   # IPF inside refinement via near pairs + mesh (_ipf_fast, linear in beads) instead of the exact
+                         # all-pairs kernel (_ipf_general, quadratic: 62% of a 138k-bead run). None: only when LENGTH_REF_UM is
+                         # set (large arrays), so the published path is unchanged.
+
+
+def _refine_ipf(X, U, tab, c, cnt, a, iters):
+    torch = _torch()
+    if REFINE_IPF_FAST if REFINE_IPF_FAST is not None else LENGTH_REF_UM is not None:
+        with torch.no_grad():
+            out = _ipf_fast(X, U, _Fast(X, U, tab, c, cnt.shared), cnt, a, iters)
+        if X.is_cuda:                                  # a new mesh size each round: drop cached cuFFT plans (workspace memory)
+            torch.backends.cuda.cufft_plan_cache[X.device.index].clear()
+        return out
+    return _ipf_general(X, U, tab, c, cnt, a, iters=iters)
+
+
 def _refine_c2f(X, U, Csr, cnt, tab, c, q, a, padR, padS):
     """refine_general with a coarse-to-fine candidate search; the normalizer grid of each pass is
     computed once and shared by both stages."""
@@ -899,7 +915,7 @@ def _refine_c2f(X, U, Csr, cnt, tab, c, q, a, padR, padS):
         Gc, Gf = _c2f_grids(W, dev)
         rad = W + (REPEL_SPACING or 0.0)
         if cnt.shared:
-            q, a = _ipf_general(X, X, tab, c, cnt, a, iters=30 if k == 0 else REFINE_IPF_ITERS)
+            q, a = _refine_ipf(X, X, tab, c, cnt, a, 30 if k == 0 else REFINE_IPF_ITERS)
             ea, eq = torch.exp(a), torch.exp(q)
             ZR = norm(X, ea, tab, c, margin=W + 50); ZC = norm(X, eq, tab, c, margin=W + 50)
             rep = _repel_lists(X, X, 0, rad) if REPEL_SPACING else None
@@ -912,13 +928,13 @@ def _refine_c2f(X, U, Csr, cnt, tab, c, q, a, padR, padS):
             X = Ctr + Gf[llf.argmax(1)]
             U = X
         else:
-            q, a = _ipf_general(X, U, tab, c, cnt, a, iters=30 if k == 0 else REFINE_IPF_ITERS)
+            q, a = _refine_ipf(X, U, tab, c, cnt, a, 30 if k == 0 else REFINE_IPF_ITERS)
             ea = torch.exp(a)
             Z = norm(U, ea, tab, c, margin=W + 50)
             rep = _repel_lists(X, torch.cat([X, U]), 0, rad) if REPEL_SPACING else None
             Ctr = X + Gc[_side_ll(X, padR, cnt.Nr, U, ea, Gc, tab, c, repel=rep, Zpre=Z).argmax(1)]
             X = Ctr + Gf[_side_ll(X, padR, cnt.Nr, U, ea, Gf, tab, c, repel=rep, center=Ctr, Zpre=Z).argmax(1)]
-            q, a = _ipf_general(X, U, tab, c, cnt, a, iters=30 if k == 0 else REFINE_IPF_ITERS)
+            q, a = _refine_ipf(X, U, tab, c, cnt, a, 30 if k == 0 else REFINE_IPF_ITERS)
             eq = torch.exp(q)
             Z = norm(X, eq, tab, c, margin=W + 50)
             rep = _repel_lists(U, torch.cat([X, U]), len(X), rad) if REPEL_SPACING else None
@@ -1232,19 +1248,50 @@ def _kfit_terms_chunked(ldz, ldn, sn, v, logk, c, q, ac, ea, rows, cols, vals, n
     return obs, near
 
 
+KFIT_ROWS = None   # kernel fit on this many random receivers (all their counts and partners) instead of all of them; None:
+                   # all receivers, except with LENGTH_REF_UM set (large arrays), where KFIT_ROWS_LARGE are used
+KFIT_ROWS_LARGE = 25_000
+
+
+class _RowSubset:
+    """Counts of a random subset of receivers (rows renumbered 0..k-1), for the kernel fit."""
+
+    def __init__(self, cnt, sel):
+        torch = _torch()
+        dev = cnt.rows.device
+        pos = torch.full((cnt.n_r,), -1, dtype=torch.long, device=dev); pos[sel] = torch.arange(len(sel), device=dev)
+        keep = pos[cnt.rows] >= 0
+        self.rows, self.cols, self.vals = pos[cnt.rows[keep]], cnt.cols[keep], cnt.vals[keep]
+        self.Nr, self.Ns = cnt.Nr[sel], cnt.Ns
+        self.n_r, self.n_o, self.shared, self.sel = len(sel), cnt.n_o, cnt.shared, sel
+
+
 def fit_kernel_fast(X, U, cnt, dev, iters=300, lr=0.05, decay=False):
-    """Poisson ML fit of the kernel, c, a, q with positions fixed, over ALL receivers and senders:
-    observed term over nonzero pairs, expected term via near pairs + far-field mesh (the kernel image is
-    re-transformed every step, differentiably)."""
+    """Poisson ML fit of the kernel, c, a, q with positions fixed, over ALL receivers and senders (or a random
+    subset of receivers, KFIT_ROWS): observed term over nonzero pairs, expected term via near pairs + far-field
+    mesh (the kernel image is re-transformed every step, differentiably)."""
     torch = _torch()
+    k = KFIT_ROWS if KFIT_ROWS is not None else (KFIT_ROWS_LARGE if LENGTH_REF_UM is not None else None)
+    if k is not None and cnt.n_r > k and WIDTH is None:     # (per-bead widths are indexed by bead: no subset)
+        g = torch.Generator(device="cpu").manual_seed(0)
+        sel = torch.randperm(cnt.n_r, generator=g)[:k].sort().values.to(dev)
+        if cnt.shared:
+            U = X                                      # every bead stays a sender
+        X, cnt = X[sel], _RowSubset(cnt, sel)
     logk = torch.tensor(np.log(KNOTS), dtype=torch.float32, device=dev)
     shared = cnt.shared
-    nb, no = _near_pairs(X, U, shared, FAST_R2)
+    sel = getattr(cnt, "sel", None)
+    if sel is None:
+        nb, no = _near_pairs(X, U, shared, FAST_R2)
+    else:                                              # receivers X = beads sel; self pairs (shared) dropped by index
+        nb, no = _near_pairs(X, U, False, FAST_R2)
+        if shared:
+            k_ = sel[nb] != no; nb, no = nb[k_], no[k_]
     dn = torch.sqrt(((X[nb] - U[no]) ** 2).sum(-1) + 1e-4)
     ldn = torch.log((dn / _pair_scale(nb, no) if WIDTH is not None else dn).clamp(float(KNOTS[0]), float(KNOTS[-1]))); sn = 1 - _switch(dn)
     dz = torch.sqrt(((X[cnt.rows] - U[cnt.cols]) ** 2).sum(-1) + 1e-4)
     ldz = torch.log((dz / _pair_scale(cnt.rows, cnt.cols) if WIDTH is not None else dz).clamp(float(KNOTS[0]), float(KNOTS[-1])))
-    P = X if shared else torch.cat([X, U])
+    P = X if (shared and sel is None) else torch.cat([X, U])
     mesh = _Mesh(P.min(0).values - FAST_R2 - 400, P.max(0).values + FAST_R2 + 400, FAST_MESH, None, 0.0, False,
                  dev, fn=lambda r: torch.zeros_like(r))
     lr_mesh = torch.log(mesh.r.clamp(float(KNOTS[0]), float(KNOTS[-1]))); s_mesh = _switch(mesh.r)
@@ -1265,7 +1312,7 @@ def fit_kernel_fast(X, U, cnt, dev, iters=300, lr=0.05, decay=False):
         mesh.khat = torch.fft.rfft2(torch.exp(_log_kernel_seg(lr_mesh, v, logk)) * s_mesh)
         far = (mesh.sample(mesh.convolve(mesh.spread(U, ea * _far_w())), X) * _far_w() if WIDTH is not None
                else mesh.sample(mesh.convolve(mesh.spread(U, ea)), X))
-        bg = c * (ea.sum() - (ea if shared else 0.0))
+        bg = c * (ea.sum() - ((ea if sel is None else ea[sel]) if shared else 0.0))
         expct = (torch.exp(q) * (near + far + bg)).sum()
         (-(obs - expct) / norm).backward()
         opt.step()
