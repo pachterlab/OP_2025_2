@@ -25,6 +25,43 @@ import time
 import numpy as np
 
 REF_DIAMETER = 3000.0
+LENGTH_REF_UM = None   # None (default, as published): every array is rescaled to REF_DIAMETER internal units and all lengths
+                       # scale with it. A number (caller's units): for arrays larger than LENGTH_REF_UM, the local, kernel-scale
+                       # lengths (_LOCAL_NAMES: kernel knots and table, near/far switch, meshes, refinement grid and windows)
+                       # are divided by array_diameter / LENGTH_REF_UM so they keep that physical size, while
+                       # array-scale settings (warp levels, density bandwidths, isotropy patches) stay relative and the isotropy
+                       # prior's contact cap follows the bead spacing (ISO_MAXLEN_MED). Near pairs then grow linearly,
+                       # not quadratically, with the bead count (large arrays).
+_LOCAL_NAMES = ("KNOTS", "TAB_STEP", "TAB_MAX", "GRID", "REFINE_WINDOWS", "FAST_R1", "FAST_R2", "FAST_MESH", "FAST_SKIN",
+                "REFINE_MESH")
+_LOCAL_SAVED = None
+
+
+def _local_factor(array_diameter):
+    return 1.0 if LENGTH_REF_UM is None else max(1.0, float(array_diameter) / float(LENGTH_REF_UM))
+
+
+class _local_scale:
+    """Context: local lengths divided by _local_factor(array_diameter) (no-op if 1 or already applied by an outer call)."""
+    def __init__(self, array_diameter):
+        self.k = _local_factor(array_diameter); self.own = False
+
+    def __enter__(self):
+        global _LOCAL_SAVED
+        if self.k == 1.0 or _LOCAL_SAVED is not None:
+            return self
+        g = globals(); _LOCAL_SAVED = {n: g[n] for n in _LOCAL_NAMES}; self.own = True
+        for n, v in _LOCAL_SAVED.items():
+            g[n] = tuple(x / self.k for x in v) if isinstance(v, tuple) else v / self.k
+        return self
+
+    def __exit__(self, *exc):
+        global _LOCAL_SAVED
+        if self.own:
+            globals().update(_LOCAL_SAVED); _LOCAL_SAVED = None
+        return False
+
+
 KNOTS = np.array([5, 10, 20, 35, 50, 75, 100, 150, 200, 300, 500, 800, 1500, 4000.])
 PHI = 30.0                     # likelihood temper in the warp stage
 LAM = 300.0                    # density-prior weight
@@ -1295,6 +1332,8 @@ def fit_kernel_nb(X, U, cnt, dev, iters=3000, lr=0.05):
 
 ISO_SCALES = (300.0, 150.0)   # contact-isotropy patches (Gaussian sd, internal units)
 ISO_TOPK, ISO_MINC, ISO_MAXLEN = 3, 3, 40.0
+ISO_MAXLEN_MED = 3.0   # with LENGTH_REF_UM set: contacts kept if shorter than this multiple of the median contact length
+                       # (tracks the bead spacing; ISO_MAXLEN = 40 internal units is ~3x it on the paper's datasets)
 ISO_SCHEDULE = ((400, 200, 4.0), (200, 200, 3.0))   # second-stage warp levels
 ISO = None                  # set per run: dict(ri, oi, weight)
 ISO_WEIGHT = 3e6            # default isotropy weight (chosen on replicate c58_8)
@@ -1323,7 +1362,8 @@ def contact_pairs(Cf, X, U, shared=False, a=None, return_counts=False):
     Uo = X if shared else U
     with torch.no_grad():
         ln = (X[ri] - Uo[oi]).norm(dim=1)
-        keep = (ln > 1e-3) & (ln < ISO_MAXLEN)
+        cap = ISO_MAXLEN if LENGTH_REF_UM is None else ISO_MAXLEN_MED * float(ln[ln > 1e-3].median())
+        keep = (ln > 1e-3) & (ln < cap)
     return (ri[keep], oi[keep], cv[keep]) if return_counts else (ri[keep], oi[keep])
 
 
@@ -1779,7 +1819,7 @@ def senders_from_receivers(C, X):
     return U
 
 
-def reconstruct(counts, receivers_init, array_diameter, phi=PHI, lam=LAM, device=None,
+def _reconstruct_impl(counts, receivers_init, array_diameter, phi=PHI, lam=LAM, device=None,
                 fit_rows=6000, seed=0, verbose=True, shared=False, footprint="disc", force_general=False,
                 exact=False, min_spacing=None, repel_weight=None, n_starts=1, fit_iters=300,
                 kernel_fit="steps", anneal=0.0, kernel=None, isotropy=ISO_WEIGHT, iso_center=False, n_passes=2,
@@ -2061,7 +2101,7 @@ def _fixed_layout(counts, receivers, senders, array_diameter, device):
     return Cf, X, U, _Counts(Cf, dev, False), dev
 
 
-def fit_kernel_at(counts, receivers, senders, array_diameter, device=None, iters=300):
+def _fit_kernel_at_impl(counts, receivers, senders, array_diameter, device=None, iters=300):
     """Fit the transfer kernel and background with receivers and senders held at the given positions (e.g. a
     reconstruction, or ground truth), as accumap does on its starting layout. Returns (knot values, background)
     in internal units, which reconstruct(kernel=...) accepts."""
@@ -2070,7 +2110,7 @@ def fit_kernel_at(counts, receivers, senders, array_diameter, device=None, iters
     return v.cpu().numpy(), float(c)
 
 
-def contact_anisotropy(counts, receivers, senders, array_diameter, device=None):
+def _contact_anisotropy_impl(counts, receivers, senders, array_diameter, device=None):
     """Anisotropy of contact directions in a layout, relative to the level expected from sampling alone (random
     directions). About 1 for a correct layout of an isotropic array; well above 1 indicates shear. Contacts are
     chosen as accumap's isotropy prior chooses them (kernel and abundances fit at these positions).
@@ -2119,7 +2159,7 @@ def umap_layout(counts, seed=0, shared=False, n_epochs=400, fast=False, backend=
                      n_components=2, n_epochs=n_epochs, n_jobs=-1 if fast else 1).fit_transform(C).astype(np.float32)
 
 
-def log_likelihood(counts, receivers, array_diameter, senders=None, shared=False, device=None):
+def _log_likelihood_impl(counts, receivers, array_diameter, senders=None, shared=False, device=None):
     """Maximized Poisson log-likelihood of a layout (no ground truth): the kernel, background, sender
     abundances and receiver capture are refit to the counts at the given positions. Higher is better;
     comparable between layouts of the same counts (e.g. to choose among several initializations)."""
@@ -2148,3 +2188,20 @@ def log_likelihood(counts, receivers, array_diameter, senders=None, shared=False
         obs = (cnt.vals * (q[cnt.rows] + a[cnt.cols] + _logm(d, tab, c))).sum()
         exp_ = (torch.exp(q) * fk.row_sums(X, U, torch.exp(a))).sum()
     return float(obs - exp_)
+
+
+
+def _with_local_scale(impl, diameter_pos):
+    """Public entry point: impl run under _local_scale(array_diameter); diameter_pos = position of array_diameter."""
+    def f(*args, **kwargs):
+        d = args[diameter_pos] if len(args) > diameter_pos else kwargs["array_diameter"]
+        with _local_scale(d):
+            return impl(*args, **kwargs)
+    f.__name__ = impl.__name__[1:-5]; f.__doc__ = impl.__doc__
+    return f
+
+
+reconstruct = _with_local_scale(_reconstruct_impl, 2)
+log_likelihood = _with_local_scale(_log_likelihood_impl, 2)
+fit_kernel_at = _with_local_scale(_fit_kernel_at_impl, 3)
+contact_anisotropy = _with_local_scale(_contact_anisotropy_impl, 3)
