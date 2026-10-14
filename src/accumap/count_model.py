@@ -652,21 +652,47 @@ def refine(X, U, C, tab, c, q, a):
 # arrays (every bead both sender and receiver, U = X, self pairs excluded). The distinct-bead
 # path above is kept unchanged for arrays that fit.
 
+COUNTS_ON_HOST = None          # nonzero counts kept in pinned CPU memory and streamed to the device in NNZ_CHUNK pieces;
+                               # None: only with LENGTH_REF_UM set and more than COUNTS_HOST_ABOVE nonzeros (large arrays)
+COUNTS_HOST_ABOVE = 100_000_000
+
+
 class _Counts:
-    """Sparse counts on the device, plus the kernel-matrix storage policy."""
+    """Sparse counts on the device (or, for large arrays, in pinned host memory: see chunks()), plus the
+    kernel-matrix storage policy."""
 
     def __init__(self, Csp, dev, shared):
         torch = _torch()
         coo = Csp.tocoo()
         self.shared = shared
         self.n_r, self.n_o = Csp.shape
-        self.rows = torch.tensor(coo.row, dtype=torch.long, device=dev)
-        self.cols = torch.tensor(coo.col, dtype=torch.long, device=dev)
-        self.vals = torch.tensor(coo.data, dtype=torch.float32, device=dev)
+        self.dev = torch.device(dev) if not isinstance(dev, torch.device) else dev
+        self.host = (COUNTS_ON_HOST if COUNTS_ON_HOST is not None
+                     else (LENGTH_REF_UM is not None and coo.nnz > COUNTS_HOST_ABOVE))
+        idt = torch.int32 if LENGTH_REF_UM is not None else torch.long     # large arrays: half the index memory
+        if self.host:
+            pin = self.dev.type == "cuda"
+            self.rows = torch.tensor(coo.row, dtype=idt); self.cols = torch.tensor(coo.col, dtype=idt)
+            self.vals = torch.tensor(coo.data, dtype=torch.float32)
+            if pin:
+                self.rows, self.cols, self.vals = self.rows.pin_memory(), self.cols.pin_memory(), self.vals.pin_memory()
+        else:
+            self.rows = torch.tensor(coo.row, dtype=idt, device=dev)
+            self.cols = torch.tensor(coo.col, dtype=idt, device=dev)
+            self.vals = torch.tensor(coo.data, dtype=torch.float32, device=dev)
         self.Nr = torch.tensor(np.asarray(Csp.sum(1)).ravel(), dtype=torch.float32, device=dev)
         self.Ns = torch.tensor(np.asarray(Csp.sum(0)).ravel(), dtype=torch.float32, device=dev)
         size = self.n_r * self.n_o
         self.kernel_store = "fp32" if size * 4 <= DENSE_FP32_BYTES else ("fp16" if size * 2 <= DENSE_FP16_BYTES else "chunked")
+
+    def chunks(self, size=None):
+        """(rows, cols, vals) on the device, NNZ_CHUNK nonzeros at a time (copied from pinned memory if host)."""
+        size = size or NNZ_CHUNK
+        for j in range(0, len(self.vals), size):
+            r, o, v = self.rows[j:j + size], self.cols[j:j + size], self.vals[j:j + size]
+            if self.host:
+                r, o, v = (t.to(self.dev, non_blocking=True) for t in (r, o, v))
+            yield r, o, v
 
 
 def _kmat_fused_eager(A, B, tab, c):
@@ -776,11 +802,34 @@ def warp_stage_general(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", 
         return X, (X if cnt.shared else U0 + warp(U0)), q, a
 
 
+class _CSRPad:
+    """Padded view of CSR rows without materializing the padded table: pad[rows, :k] gives (len(rows), k) partner
+    indices (field="indices") or counts (field="data"), zero beyond each row's length (as the padded table)."""
+
+    def __init__(self, indptr, arr):
+        self.indptr, self.arr = indptr, arr
+
+    def __getitem__(self, key):
+        torch = _torch()
+        rows, sl = key
+        k = sl.stop
+        start = self.indptr[rows]; ln = self.indptr[rows + 1] - start
+        pos = start[:, None] + torch.arange(k)[None, :]
+        m = torch.arange(k)[None, :] < ln[:, None]
+        out = self.arr[pos.clamp(max=len(self.arr) - 1)]
+        return torch.where(m, out, torch.zeros((), dtype=out.dtype))
+
+
 def _padded_sparse(Csr, dev):
     """Per-row partner lists padded to the longest row; kept in CPU memory (the longest row can be
-    ~10x the median), batches are moved to the device in _side_ll."""
+    ~10x the median), batches are moved to the device in _side_ll. With LENGTH_REF_UM set (large arrays) the
+    table is not materialized: rows are padded per batch from the CSR arrays (_CSRPad)."""
     torch = _torch()
     nnz = np.diff(Csr.indptr)
+    if LENGTH_REF_UM is not None:
+        ip = torch.tensor(Csr.indptr, dtype=torch.long)
+        return (_CSRPad(ip, torch.tensor(Csr.indices, dtype=torch.long)), _CSRPad(ip, torch.tensor(Csr.data, dtype=torch.float32)),
+                torch.tensor(nnz), np.argsort(nnz))
     K = max(int(nnz.max()), 1)
     idx = np.zeros((Csr.shape[0], K), np.int64)
     val = np.zeros((Csr.shape[0], K), np.float32)
@@ -1063,6 +1112,8 @@ class _Mesh:
 def _near_pairs(X, U, shared, radius, chunk=2000):
     """(receiver, sender) index pairs closer than radius (self pairs excluded when shared)."""
     torch = _torch()
+    if _near_cells_on():                           # large arrays: from grid cells (linear), not all-pairs distances
+        return _near_pairs_cells(X, U, shared, radius)
     small = len(X) * len(U) > NEAR_INT32_ABOVE      # very large arrays: int32 indices (half the memory, same values)
     rr, oo = [], []
     for i in range(0, len(X), chunk):
@@ -1081,6 +1132,116 @@ def _near_pairs(X, U, shared, radius, chunk=2000):
 NEAR_INT32_ABOVE = 2e9   # receivers x senders above which near-pair indices are int32; every paper dataset is below it
 
 
+NEAR_CELLS = None             # near sums from a cell grid rebuilt on every call (no stored pair list; linear build);
+                              # None: on only with LENGTH_REF_UM set (large arrays)
+NEAR_CELL_BATCH = 40_000_000  # padded (receiver x candidate) entries per batch of cells
+
+
+def _near_cells_on():
+    return NEAR_CELLS if NEAR_CELLS is not None else LENGTH_REF_UM is not None
+
+
+def _cell_lists(X, U, radius):
+    """Receivers X grouped by grid cell (side radius / 2) and, per cell, the senders U in its 5 x 5 cell
+    neighbourhood (every sender within `radius` of any of the cell's receivers), both padded:
+    (R (n_cell, maxR), Rm mask, S (n_cell, maxS), Sm mask)."""
+    torch = _torch()
+    with torch.no_grad():
+        L = radius / 2.0
+        lo = torch.minimum(X.min(0).values, U.min(0).values) - 2 * L
+        gx = ((X - lo) / L).floor().long(); gu = ((U - lo) / L).floor().long()
+        ny = int(max(gx[:, 1].max(), gu[:, 1].max())) + 3
+        cu = gu[:, 0] * ny + gu[:, 1]
+        ou = torch.argsort(cu); cus = cu[ou]
+        ncell = int(max(int(cus[-1]), int((gx[:, 0] * ny + gx[:, 1]).max()))) + 2 * ny + 3
+        ucount = torch.bincount(cus, minlength=ncell); ustart = torch.cumsum(ucount, 0) - ucount
+        cx = gx[:, 0] * ny + gx[:, 1]
+        ox = torch.argsort(cx); cxs = cx[ox]
+        cells, rc = torch.unique_consecutive(cxs, return_counts=True)
+        rs = torch.cumsum(rc, 0) - rc
+        maxR = int(rc.max()); ar = torch.arange(maxR, device=X.device)
+        R = ox[(rs[:, None] + ar[None, :]).clamp(max=len(ox) - 1)]; Rm = ar[None, :] < rc[:, None]
+        off = torch.tensor([dx * ny + dy for dx in range(-2, 3) for dy in range(-2, 3)], device=X.device)
+        nbc = (cells[:, None] + off[None, :]).clamp(0, ncell - 1)          # cells padded by 2 on every side: no wrap
+        cnt = ucount[nbc]; st = ustart[nbc]
+        cum = torch.cumsum(cnt, 1); tot = cum[:, -1]
+        maxS = int(tot.max()); js = torch.arange(maxS, device=X.device)
+        seg = torch.searchsorted(cum, js[None, :].expand(len(cells), maxS).contiguous(), right=True).clamp(max=24)
+        within = js[None, :] - (cum - cnt).gather(1, seg)
+        S = ou[(st.gather(1, seg) + within).clamp(0, len(ou) - 1)]; Sm = js[None, :] < tot[:, None]
+    return R, Rm, S, Sm
+
+
+def _cell_k_eager(Xr, Us, ok, tab, c):
+    """K(d) (1 - S(d)) for receivers Xr (b, r, 2) x candidates Us (b, s, 2), zero where not ok or d >= FAST_R2."""
+    torch = _torch()
+    d = torch.sqrt(((Xr[:, :, None, :] - Us[:, None, :, :]) ** 2).sum(-1) + 1e-4)
+    f = (d / TAB_STEP).clamp(0, tab.shape[0] - 1.001)
+    i = f.floor().long(); t = f - i
+    k = tab[i] * (1 - t) + tab[i + 1] * t
+    x = ((d - FAST_R1) / (FAST_R2 - FAST_R1)).clamp(0, 1)
+    return torch.where(ok & (d < FAST_R2), k * (1 - x * x * (3 - 2 * x)), torch.zeros((), dtype=k.dtype, device=k.device))
+
+
+def _cell_rows_eager(X, U, R, Rm, S, Sm, w, tab, c, shared):
+    """Per receiver in R: sum over candidates of w_o K (1 - S) (one batch of cells)."""
+    ok = Rm[:, :, None] & Sm[:, None, :]
+    if shared:
+        ok = ok & (R[:, :, None] != S[:, None, :])
+    return (_cell_k_eager(X[R], U[S], ok, tab, c) * w[S][:, None, :]).sum(-1)
+
+
+def _cell_cols_eager(X, U, R, Rm, S, Sm, v, tab, c, shared):
+    """Per candidate sender in S: sum over the batch's receivers of v_b K (1 - S)."""
+    ok = Rm[:, :, None] & Sm[:, None, :]
+    if shared:
+        ok = ok & (R[:, :, None] != S[:, None, :])
+    return (_cell_k_eager(X[R], U[S], ok, tab, c) * v[R][:, :, None]).sum(1)
+
+
+_cell_rows = _maybe_compiled(_cell_rows_eager)
+_cell_cols = _maybe_compiled(_cell_cols_eager)
+
+
+def _near_sum_cells(X, U, w, tab, c, shared, transpose=False):
+    """Near-field sums without a stored pair list (exactly the stored-pair sums at radius FAST_R2):
+    transpose=False: s_b = sum_o w_o K(d_bo)(1 - S(d_bo)) over receivers X; True: t_o = sum_b w_b K (1 - S) over U."""
+    torch = _torch()
+    from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
+    R, Rm, S, Sm = _cell_lists(X.detach(), U.detach(), float(FAST_R2))
+    per = max(1, NEAR_CELL_BATCH // (R.shape[1] * S.shape[1]))
+    grad = torch.is_grad_enabled()
+    out = torch.zeros(len(U) if transpose else len(X), device=X.device, dtype=w.dtype)
+    f = _cell_cols if transpose else _cell_rows
+    with set_checkpoint_early_stop(False):
+        for j in range(0, len(R), per):
+            a = (X, U, R[j:j + per], Rm[j:j + per], S[j:j + per], Sm[j:j + per], w, tab, c, shared)
+            part = checkpoint(f, *a, use_reentrant=False) if grad else f(*a)
+            idx, m = (S[j:j + per], Sm[j:j + per]) if transpose else (R[j:j + per], Rm[j:j + per])
+            out = out.index_add(0, idx[m], part[m])
+    return out
+
+
+def _near_pairs_cells(X, U, shared, radius):
+    """As _near_pairs, from the cell lists of _cell_lists (int32 indices, sorted by receiver)."""
+    torch = _torch()
+    with torch.no_grad():
+        R, Rm, S, Sm = _cell_lists(X, U, float(radius))
+        per = max(1, NEAR_CELL_BATCH // (R.shape[1] * S.shape[1]))
+        rr, oo = [], []
+        for j in range(0, len(R), per):
+            r, rm, o, om = R[j:j + per], Rm[j:j + per], S[j:j + per], Sm[j:j + per]
+            d = torch.cdist(X[r], U[o])
+            ok = rm[:, :, None] & om[:, None, :] & (d < radius)
+            if shared:
+                ok = ok & (r[:, :, None] != o[:, None, :])
+            b, i, k = torch.nonzero(ok, as_tuple=True)
+            rr.append(r[b, i].int()); oo.append(o[b, k].int())
+        nb, no = torch.cat(rr), torch.cat(oo)
+        srt = torch.argsort(nb)
+        return nb[srt], no[srt]
+
+
 class _Fast:
     """Kernel sums  s_b = sum_o w_o m(|x_b - u_o|)  (and the transpose) via near pairs + mesh."""
 
@@ -1095,6 +1256,8 @@ class _Fast:
         self.rebuild(X, U)
 
     def rebuild(self, X, U):
+        if _near_cells_on() and WIDTH is None:          # large arrays: no stored pairs (sums from cells, per call)
+            self.nb = self.no = None; return
         self.nb, self.no = _near_pairs(X.detach(), U.detach(), self.shared, FAST_R2 + FAST_SKIN)
 
     def near_weight(self, X, U):
@@ -1105,7 +1268,8 @@ class _Fast:
     def row_sums(self, X, U, w):
         """s_b = sum_o w_o (K(d_bo) + c), self excluded when shared (differentiable)."""
         torch = _torch()
-        near = _near_sum(X, U, self.nb, self.no, w, self.tab, self.ct, len(X))
+        near = (_near_sum_cells(X, U, w, self.tab, self.ct, self.shared) if self.nb is None else
+                (_near_sum_eager if LENGTH_REF_UM is not None and len(self.nb) > NEAR_CHUNK_ABOVE else _near_sum)(X, U, self.nb, self.no, w, self.tab, self.ct, len(X)))
         if WIDTH is not None:
             fw = _far_w(); far = self.mesh.sample(self.mesh.convolve(self.mesh.spread(U, w * fw)), X) * fw
         else:
@@ -1116,7 +1280,8 @@ class _Fast:
     def col_sums(self, X, U, v):
         """t_o = sum_b v_b (K(d_bo) + c)."""
         torch = _torch()
-        near = _near_sum(U, X, self.no, self.nb, v, self.tab, self.ct, len(U))
+        near = (_near_sum_cells(X, U, v, self.tab, self.ct, self.shared, transpose=True) if self.nb is None else
+                (_near_sum_eager if LENGTH_REF_UM is not None and len(self.nb) > NEAR_CHUNK_ABOVE else _near_sum)(U, X, self.no, self.nb, v, self.tab, self.ct, len(U)))
         if WIDTH is not None:
             fw = _far_w(); far = self.mesh.sample(self.mesh.convolve(self.mesh.spread(X, v * fw)), U) * fw
         else:
@@ -1137,18 +1302,21 @@ def _obs_term_eager(X, U, rows, cols, vals, tab, c):
     return (vals * torch.log(tab[i] * (1 - t) + tab[i + 1] * t + c)).sum()
 
 
-NEAR_CHUNK_ABOVE = 20_000_000   # with WIDTH set: near pairs above which the near sum is chunked + checkpointed (memory)
+NEAR_CHUNK_ABOVE = 20_000_000   # with WIDTH or LENGTH_REF_UM set: near pairs above which the near sum is chunked +
+                                # checkpointed (per-pair temporaries of one chunk at a time; memory)
 
 
 def _near_sum_eager(X, U, nb, no, w, tab, c, n_out):
     torch = _torch()
-    if WIDTH is not None and len(nb) > NEAR_CHUNK_ABOVE:
-        from torch.utils.checkpoint import checkpoint
+    if (WIDTH is not None or LENGTH_REF_UM is not None) and len(nb) > NEAR_CHUNK_ABOVE:
+        from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
+        f = _near_sum_eager_1 if WIDTH is not None else _near_sum_chunk     # fused per chunk unless per-bead widths
         grad = torch.is_grad_enabled()
         out = torch.zeros(n_out, device=X.device, dtype=w.dtype)
-        for j in range(0, len(nb), NNZ_CHUNK):
-            args = (X, U, nb[j:j + NNZ_CHUNK], no[j:j + NNZ_CHUNK], w, tab, c, n_out)
-            out = out + (checkpoint(_near_sum_eager_1, *args, use_reentrant=False) if grad else _near_sum_eager_1(*args))
+        with set_checkpoint_early_stop(False):   # early stop raises through _maybe_compiled's fallback; recompute fully
+            for j in range(0, len(nb), NNZ_CHUNK):
+                args = (X, U, nb[j:j + NNZ_CHUNK], no[j:j + NNZ_CHUNK], w, tab, c, n_out)
+                out = out + (checkpoint(f, *args, use_reentrant=False) if grad else f(*args))
         return out
     return _near_sum_eager_1(X, U, nb, no, w, tab, c, n_out)
 
@@ -1169,6 +1337,7 @@ def _near_sum_eager_1(X, U, nb, no, w, tab, c, n_out):
 
 _obs_term = _maybe_compiled(_obs_term_eager)
 _near_sum = _maybe_compiled(_near_sum_eager)
+_near_sum_chunk = _maybe_compiled(_near_sum_eager_1)   # one chunk of the chunked near sum (large arrays)
 
 
 def _ipf_fast(X, U, fk, cnt, a, iters):
@@ -1185,6 +1354,19 @@ def _ll_and_grad_fast(X0, U0, warp, cnt, q, a, fk, tab, c):
     torch = _torch()
     X = X0 + warp(X0)                          # each bead warped once per step; pairs gather from these
     U = X if cnt.shared else U0 + warp(U0)
+    if cnt.host:
+        # counts streamed from host memory: gradients w.r.t. the warped positions chunk by chunk (each chunk's graph
+        # freed at once), then one backward pass through the warp
+        assert not JOINT_WIDTH, "JOINT_WIDTH needs device-resident counts"
+        Xd = X.detach().requires_grad_(True); Ud = Xd if cnt.shared else U.detach().requires_grad_(True)
+        ((torch.exp(q) * fk.row_sums(Xd, Ud, torch.exp(a))).sum() / 1e6).backward()
+        for r, o, v in cnt.chunks():
+            (-_obs_term(Xd, Ud, r, o, v, tab, fk.ct) / 1e6).backward()
+        if cnt.shared:
+            torch.autograd.backward([X], [Xd.grad])
+        else:
+            torch.autograd.backward([X, U], [Xd.grad, Ud.grad])
+        return
     loss = (torch.exp(q) * fk.row_sums(X, U, torch.exp(a))).sum()
     for j in range(0, len(cnt.vals), NNZ_CHUNK):
         loss = loss - _obs_term(X, U, cnt.rows[j:j + NNZ_CHUNK], cnt.cols[j:j + NNZ_CHUNK], cnt.vals[j:j + NNZ_CHUNK],
@@ -1258,12 +1440,12 @@ class _RowSubset:
 
     def __init__(self, cnt, sel):
         torch = _torch()
-        dev = cnt.rows.device
-        pos = torch.full((cnt.n_r,), -1, dtype=torch.long, device=dev); pos[sel] = torch.arange(len(sel), device=dev)
-        keep = pos[cnt.rows] >= 0
-        self.rows, self.cols, self.vals = pos[cnt.rows[keep]], cnt.cols[keep], cnt.vals[keep]
+        dev = sel.device; src = cnt.rows.device; s_ = sel.to(src)
+        pos = torch.full((cnt.n_r,), -1, dtype=torch.long, device=src); pos[s_] = torch.arange(len(sel), device=src)
+        keep = pos[cnt.rows.long()] >= 0
+        self.rows = pos[cnt.rows[keep].long()].to(dev); self.cols = cnt.cols[keep].to(dev); self.vals = cnt.vals[keep].to(dev)
         self.Nr, self.Ns = cnt.Nr[sel], cnt.Ns
-        self.n_r, self.n_o, self.shared, self.sel = len(sel), cnt.n_o, cnt.shared, sel
+        self.n_r, self.n_o, self.shared, self.sel, self.host = len(sel), cnt.n_o, cnt.shared, sel, False
 
 
 def fit_kernel_fast(X, U, cnt, dev, iters=300, lr=0.05, decay=False):
@@ -1272,12 +1454,13 @@ def fit_kernel_fast(X, U, cnt, dev, iters=300, lr=0.05, decay=False):
     mesh (the kernel image is re-transformed every step, differentiably)."""
     torch = _torch()
     k = KFIT_ROWS if KFIT_ROWS is not None else (KFIT_ROWS_LARGE if LENGTH_REF_UM is not None else None)
-    if k is not None and cnt.n_r > k and WIDTH is None:     # (per-bead widths are indexed by bead: no subset)
-        g = torch.Generator(device="cpu").manual_seed(0)
-        sel = torch.randperm(cnt.n_r, generator=g)[:k].sort().values.to(dev)
+    if ((k is not None and cnt.n_r > k) or cnt.host) and WIDTH is None:   # (per-bead widths are indexed by bead: no subset)
+        g = torch.Generator(device="cpu").manual_seed(0)        # host-resident counts: device copy of (a subset of) rows
+        sel = torch.randperm(cnt.n_r, generator=g)[:min(k or cnt.n_r, cnt.n_r)].sort().values.to(dev)
         if cnt.shared:
             U = X                                      # every bead stays a sender
         X, cnt = X[sel], _RowSubset(cnt, sel)
+    assert not cnt.host, "kernel fit on host-resident counts needs the receiver subset (KFIT_ROWS; not with WIDTH)"
     logk = torch.tensor(np.log(KNOTS), dtype=torch.float32, device=dev)
     shared = cnt.shared
     sel = getattr(cnt, "sel", None)
@@ -1655,7 +1838,7 @@ def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", ver
                 q, a = _ipf_fast(Xc, Uc, fk, cnt, a, IPF_WARM_ITERS)
         warp = _Warp(lo, hi, spacing, dev, init_field=warp)
         opt = torch.optim.Adam([warp.D], lr=lr)
-        compiled = (WARP_COMPILE and dev.type == "cuda" and not cnt.shared and isinstance(footprint, str)
+        compiled = (WARP_COMPILE and dev.type == "cuda" and not cnt.shared and not cnt.host and isinstance(footprint, str)
                     and footprint == "disc" and KDE_FFT and not EDGE_CORRECT and ANNEAL <= 0)
         for it in range(steps):
             if compiled:
@@ -2231,8 +2414,10 @@ def _log_likelihood_impl(counts, receivers, array_diameter, senders=None, shared
     with torch.no_grad():
         fk = _Fast(X, U, tab, c, shared)
         q, a = _ipf_fast(X, U, fk, cnt, torch.zeros(cnt.n_o, device=dev), 30)
-        d = torch.sqrt(((X[cnt.rows] - U[cnt.cols]) ** 2).sum(-1) + 1e-4)
-        obs = (cnt.vals * (q[cnt.rows] + a[cnt.cols] + _logm(d, tab, c))).sum()
+        obs = 0.0
+        for r, o, v in cnt.chunks():
+            d = torch.sqrt(((X[r] - U[o]) ** 2).sum(-1) + 1e-4)
+            obs = obs + (v * (q[r] + a[o] + _logm(d, tab, c))).sum()
         exp_ = (torch.exp(q) * fk.row_sums(X, U, torch.exp(a))).sum()
     return float(obs - exp_)
 
