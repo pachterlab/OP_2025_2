@@ -35,6 +35,22 @@ LENGTH_REF_UM = None   # None (default, as published): every array is rescaled t
 _LOCAL_NAMES = ("KNOTS", "TAB_STEP", "TAB_MAX", "GRID", "REFINE_WINDOWS", "FAST_R1", "FAST_R2", "FAST_MESH", "FAST_SKIN",
                 "REFINE_MESH")
 _LOCAL_SAVED = None
+_LOCAL_K = 1.0         # the factor applied by the active _local_scale (1: none)
+WARP_FINE_LEVELS = False  # True: with LENGTH_REF_UM set, the main warp schedule gains halving levels until its finest grid
+                          # spacing keeps its physical size at the reference array (as the local lengths). Off: no gain on
+                          # the 9 and 18 mm simulations (19.6 vs 20.4 um; 215 vs 215 um)
+
+
+def _warp_schedule(base):
+    """WARP_SCHEDULE, extended for large arrays (see WARP_FINE_LEVELS): halved spacing, same steps, 0.75x rate."""
+    if not WARP_FINE_LEVELS or LENGTH_REF_UM is None or _LOCAL_K <= 1.0:
+        return base
+    target = base[-1][0] / _LOCAL_K
+    sched = list(base)
+    while sched[-1][0] > 1.05 * target:
+        sp_, st, lr = sched[-1]
+        sched.append((sp_ / 2, st, lr * 0.75))
+    return tuple(sched)
 
 
 def _local_factor(array_diameter):
@@ -50,15 +66,17 @@ class _local_scale:
         global _LOCAL_SAVED
         if self.k == 1.0 or _LOCAL_SAVED is not None:
             return self
+        global _LOCAL_K
         g = globals(); _LOCAL_SAVED = {n: g[n] for n in _LOCAL_NAMES}; self.own = True
         for n, v in _LOCAL_SAVED.items():
             g[n] = tuple(x / self.k for x in v) if isinstance(v, tuple) else v / self.k
+        _LOCAL_K = self.k
         return self
 
     def __exit__(self, *exc):
-        global _LOCAL_SAVED
+        global _LOCAL_SAVED, _LOCAL_K
         if self.own:
-            globals().update(_LOCAL_SAVED); _LOCAL_SAVED = None
+            globals().update(_LOCAL_SAVED); _LOCAL_SAVED = None; _LOCAL_K = 1.0
         return False
 
 
@@ -1828,7 +1846,7 @@ def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", ver
             cb, co = fk.nb[ck], fk.no[ck]
             cdeg = torch.bincount(cb, minlength=len(X0)).clamp(min=1).float()
         lopt = torch.optim.Adam([WIDTH_LAM], lr=JOINT_LR)
-    for spacing, steps, lr in (schedule or WARP_SCHEDULE):
+    for spacing, steps, lr in (schedule or _warp_schedule(WARP_SCHEDULE)):
         if ANNEAL > 0:
             tab = _kernel_table(KERNEL_V, dev, ANNEAL * spacing)
             with torch.no_grad():
