@@ -589,7 +589,11 @@ def _density_grid_split(P, w, tab, c, margin, tile=64):
     gy = torch.arange(float(lo[1]), float(hi[1]) + GRID, GRID, device=P.device)
     Z = torch.empty(len(gx), len(gy), device=P.device)
     ct = torch.as_tensor(float(c), dtype=torch.float32, device=P.device)
-    for i0 in range(0, len(gx), tile):
+    if _near_cells_on():          # large arrays: the near part from grid cells (linear; the tile loop scans all points per tile)
+        GX, GY = torch.meshgrid(gx, gy, indexing="ij")
+        with torch.no_grad():
+            Z = _near_sum_cells(torch.stack([GX.reshape(-1), GY.reshape(-1)], -1), P.detach(), w.detach(), tab, ct, False).reshape(len(gx), len(gy))
+    for i0 in (range(0, len(gx), tile) if not _near_cells_on() else ()):
         for j0 in range(0, len(gy), tile):
             tx, ty = gx[i0:i0 + tile], gy[j0:j0 + tile]
             Gt = torch.stack(torch.meshgrid(tx, ty, indexing="ij"), -1).reshape(-1, 2)
@@ -932,6 +936,8 @@ def _side_ll(Pos, pad, N, Other, w_other, G, tab, c, self_w=None, mG=None, repel
 
 REFINE_ROUNDS = "converge"   # refinement rounds per stage: "converge" (until fewer than REFINE_TOL of beads move) or an int
 REFINE_TOL, REFINE_MAX_ROUNDS = 0.01, 12
+REFINE_MAX_ROUNDS_LARGE = 6   # with LENGTH_REF_UM set: round cap per stage (Hu 12 mm sim: accuracy flat after ~4 rounds in
+                              # stage 1 and ~1 in stage 2 while ~half the beads keep jittering > 0.25 units); None: REFINE_MAX_ROUNDS
 REFINE_IPF_ITERS = 30   # IPF iterations per refinement round after the first (warm-started; the first uses 30)
 REFINE_LOG = []        # per-round movement, appended by _refine_c2f (diagnostic)
 REFINE_CALLBACK = None   # optional callable(X, U) after each refinement round (diagnostic)
@@ -973,7 +979,8 @@ def _refine_c2f(X, U, Csr, cnt, tab, c, q, a, padR, padS):
     k = 0
     while True:
         if REFINE_ROUNDS == "converge":
-            if k >= REFINE_MAX_ROUNDS or (k >= len(REFINE_WINDOWS) and REFINE_LOG and REFINE_LOG[-1]["moved_frac"] < REFINE_TOL):
+            cap = REFINE_MAX_ROUNDS if (LENGTH_REF_UM is None or REFINE_MAX_ROUNDS_LARGE is None) else min(REFINE_MAX_ROUNDS, REFINE_MAX_ROUNDS_LARGE)
+            if k >= cap or (k >= len(REFINE_WINDOWS) and REFINE_LOG and REFINE_LOG[-1]["moved_frac"] < REFINE_TOL):
                 break
         elif k >= max(int(REFINE_ROUNDS), 1):
             break
@@ -1177,13 +1184,13 @@ def _cell_lists(X, U, radius):
         ox = torch.argsort(cx); cxs = cx[ox]
         cells, rc = torch.unique_consecutive(cxs, return_counts=True)
         rs = torch.cumsum(rc, 0) - rc
-        maxR = int(rc.max()); ar = torch.arange(maxR, device=X.device)
+        maxR = -(-int(rc.max()) // 32) * 32; ar = torch.arange(maxR, device=X.device)         # widths bucketed (fewer compiled shapes)
         R = ox[(rs[:, None] + ar[None, :]).clamp(max=len(ox) - 1)]; Rm = ar[None, :] < rc[:, None]
         off = torch.tensor([dx * ny + dy for dx in range(-2, 3) for dy in range(-2, 3)], device=X.device)
         nbc = (cells[:, None] + off[None, :]).clamp(0, ncell - 1)          # cells padded by 2 on every side: no wrap
         cnt = ucount[nbc]; st = ustart[nbc]
         cum = torch.cumsum(cnt, 1); tot = cum[:, -1]
-        maxS = int(tot.max()); js = torch.arange(maxS, device=X.device)
+        maxS = -(-int(tot.max()) // 128) * 128; js = torch.arange(maxS, device=X.device)
         seg = torch.searchsorted(cum, js[None, :].expand(len(cells), maxS).contiguous(), right=True).clamp(max=24)
         within = js[None, :] - (cum - cnt).gather(1, seg)
         S = ou[(st.gather(1, seg) + within).clamp(0, len(ou) - 1)]; Sm = js[None, :] < tot[:, None]
@@ -1221,22 +1228,119 @@ _cell_rows = _maybe_compiled(_cell_rows_eager)
 _cell_cols = _maybe_compiled(_cell_cols_eager)
 
 
+def _cell_kd_eager(Xr, Us, ok, tab):
+    """k = K(d)(1 - S(d)) and dk/dd for receivers Xr (b, r, 2) x candidates Us (b, s, 2) (zero where not ok or d >= FAST_R2),
+    with the offsets D = x - u and distances d (as _cell_k_eager, which autograd would differentiate the same way)."""
+    torch = _torch()
+    D = Xr[:, :, None, :] - Us[:, None, :, :]
+    d = torch.sqrt((D ** 2).sum(-1) + 1e-4)
+    fr = d / TAB_STEP; hi = tab.shape[0] - 1.001
+    f = fr.clamp(0, hi); i = f.floor().long(); t = f - i
+    K = tab[i] * (1 - t) + tab[i + 1] * t
+    dK = torch.where((fr > 0) & (fr < hi), (tab[i + 1] - tab[i]) / TAB_STEP, torch.zeros((), dtype=K.dtype, device=K.device))
+    xr = (d - FAST_R1) / (FAST_R2 - FAST_R1); x = xr.clamp(0, 1)
+    sw = x * x * (3 - 2 * x)
+    dsw = torch.where((xr > 0) & (xr < 1), 6 * x * (1 - x) / (FAST_R2 - FAST_R1), torch.zeros((), dtype=K.dtype, device=K.device))
+    m = ok & (d < FAST_R2); z = torch.zeros((), dtype=K.dtype, device=K.device)
+    return torch.where(m, K * (1 - sw), z), torch.where(m, dK * (1 - sw) - K * dsw, z), D, d
+
+
+def _cell_ok(R, Rm, S, Sm, shared):
+    ok = Rm[:, :, None] & Sm[:, None, :]
+    return ok & (R[:, :, None] != S[:, None, :]) if shared else ok
+
+
+def _cell_rows_grad_eager(X, U, R, Rm, S, Sm, w, tab, shared, g):
+    """Gradients of sum_b g_b s_b (s_b = sum_o w_o k(d_bo)) for one batch: (dX (b, r, 2), dU (b, s, 2), dw (b, s))."""
+    k, dk, D, d = _cell_kd_eager(X[R], U[S], _cell_ok(R, Rm, S, Sm, shared), tab)
+    gb = g[R]
+    coef = (gb[:, :, None] * w[S][:, None, :] * dk / d)[..., None] * D
+    return coef.sum(2), -coef.sum(1), (gb[:, :, None] * k).sum(1)
+
+
+def _cell_cols_grad_eager(X, U, R, Rm, S, Sm, v, tab, shared, g):
+    """Gradients of sum_o g_o t_o (t_o = sum_b v_b k(d_bo)) for one batch: (dX (b, r, 2), dU (b, s, 2), dv (b, r))."""
+    k, dk, D, d = _cell_kd_eager(X[R], U[S], _cell_ok(R, Rm, S, Sm, shared), tab)
+    go = g[S]
+    coef = (v[R][:, :, None] * go[:, None, :] * dk / d)[..., None] * D
+    return coef.sum(2), -coef.sum(1), (go[:, None, :] * k).sum(2)
+
+
+_cell_rows_grad = _maybe_compiled(_cell_rows_grad_eager)
+_cell_cols_grad = _maybe_compiled(_cell_cols_grad_eager)
+
+
+def _cell_batches(R, Rm, S, Sm):
+    """Batches of cells, all padded to the same number of cells (masked dummies), so compiled kernels see few shapes."""
+    torch = _torch()
+    per = max(1, NEAR_CELL_BATCH // (R.shape[1] * S.shape[1]))
+    for j in range(0, len(R), per):
+        r, rm, s_, sm = R[j:j + per], Rm[j:j + per], S[j:j + per], Sm[j:j + per]
+        if len(r) < per and len(R) > per:
+            pad = per - len(r)
+            r = torch.cat([r, r[:1].expand(pad, -1)]); s_ = torch.cat([s_, s_[:1].expand(pad, -1)])
+            rm = torch.cat([rm, torch.zeros((pad, rm.shape[1]), dtype=rm.dtype, device=rm.device)])
+            sm = torch.cat([sm, torch.zeros((pad, sm.shape[1]), dtype=sm.dtype, device=sm.device)])
+        yield r, rm, s_, sm
+
+
+_NEAR_CELLS_FN = None
+
+
+def _near_cells_fn():
+    """torch.autograd.Function for the cell near sums: forward and backward in batches with analytic derivatives (no
+    checkpointing: memory bounded by NEAR_CELL_BATCH; both directions compiled)."""
+    global _NEAR_CELLS_FN
+    if _NEAR_CELLS_FN is not None:
+        return _NEAR_CELLS_FN
+    torch = _torch()
+
+    class NearCells(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, X, U, w, tab, c, shared, transpose):
+            R, Rm, S, Sm = _cell_lists(X.detach(), U.detach(), float(FAST_R2))
+            out = torch.zeros(len(U) if transpose else len(X), device=X.device, dtype=w.dtype)
+            f = _cell_cols if transpose else _cell_rows
+            with torch.no_grad():
+                for r, rm, s_, sm in _cell_batches(R, Rm, S, Sm):
+                    part = f(X, U, r, rm, s_, sm, w, tab, c, shared)
+                    idx, m = (s_, sm) if transpose else (r, rm)
+                    out.index_add_(0, idx[m], part[m])
+            ctx.save_for_backward(X, U, w, tab, R, Rm, S, Sm)
+            ctx.shared, ctx.transpose = shared, transpose
+            return out
+
+        @staticmethod
+        def backward(ctx, gout):
+            X, U, w, tab, R, Rm, S, Sm = ctx.saved_tensors
+            gX, gU, gw = torch.zeros_like(X), torch.zeros_like(U), torch.zeros_like(w)
+            f = _cell_cols_grad if ctx.transpose else _cell_rows_grad
+            with torch.no_grad():
+                for r, rm, s_, sm in _cell_batches(R, Rm, S, Sm):
+                    dx, du, dw = f(X, U, r, rm, s_, sm, w, tab, ctx.shared, gout)
+                    gX.index_add_(0, r[rm], dx[rm]); gU.index_add_(0, s_[sm], du[sm])
+                    wi, wm = (r, rm) if ctx.transpose else (s_, sm)
+                    gw.index_add_(0, wi[wm], dw[wm])
+            return gX, gU, gw, None, None, None, None
+
+    _NEAR_CELLS_FN = NearCells
+    return NearCells
+
+
 def _near_sum_cells(X, U, w, tab, c, shared, transpose=False):
     """Near-field sums without a stored pair list (exactly the stored-pair sums at radius FAST_R2):
-    transpose=False: s_b = sum_o w_o K(d_bo)(1 - S(d_bo)) over receivers X; True: t_o = sum_b w_b K (1 - S) over U."""
+    transpose=False: s_b = sum_o w_o K(d_bo)(1 - S(d_bo)) over receivers X; True: t_o = sum_b w_b K (1 - S) over U.
+    With gradients: _near_cells_fn (analytic backward, batched); without: compiled forward batches."""
     torch = _torch()
-    from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
+    if torch.is_grad_enabled() and (X.requires_grad or U.requires_grad or w.requires_grad):
+        return _near_cells_fn().apply(X, U, w, tab, c, shared, transpose)
     R, Rm, S, Sm = _cell_lists(X.detach(), U.detach(), float(FAST_R2))
-    per = max(1, NEAR_CELL_BATCH // (R.shape[1] * S.shape[1]))
-    grad = torch.is_grad_enabled()
     out = torch.zeros(len(U) if transpose else len(X), device=X.device, dtype=w.dtype)
     f = _cell_cols if transpose else _cell_rows
-    with set_checkpoint_early_stop(False):
-        for j in range(0, len(R), per):
-            a = (X, U, R[j:j + per], Rm[j:j + per], S[j:j + per], Sm[j:j + per], w, tab, c, shared)
-            part = checkpoint(f, *a, use_reentrant=False) if grad else f(*a)
-            idx, m = (S[j:j + per], Sm[j:j + per]) if transpose else (R[j:j + per], Rm[j:j + per])
-            out = out.index_add(0, idx[m], part[m])
+    for r, rm, s_, sm in _cell_batches(R, Rm, S, Sm):
+        part = f(X, U, r, rm, s_, sm, w, tab, c, shared)
+        idx, m = (s_, sm) if transpose else (r, rm)
+        out = out.index_add(0, idx[m], part[m])
     return out
 
 
@@ -1328,8 +1432,8 @@ def _near_sum_eager(X, U, nb, no, w, tab, c, n_out):
     torch = _torch()
     if (WIDTH is not None or LENGTH_REF_UM is not None) and len(nb) > NEAR_CHUNK_ABOVE:
         from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
-        f = _near_sum_eager_1 if WIDTH is not None else _near_sum_chunk     # fused per chunk unless per-bead widths
         grad = torch.is_grad_enabled()
+        f = _near_sum_eager_1 if (WIDTH is not None or grad) else _near_sum_chunk   # compiled only without gradients (see _near_sum_cells)
         out = torch.zeros(n_out, device=X.device, dtype=w.dtype)
         with set_checkpoint_early_stop(False):   # early stop raises through _maybe_compiled's fallback; recompute fully
             for j in range(0, len(nb), NNZ_CHUNK):
@@ -1358,12 +1462,29 @@ _near_sum = _maybe_compiled(_near_sum_eager)
 _near_sum_chunk = _maybe_compiled(_near_sum_eager_1)   # one chunk of the chunked near sum (large arrays)
 
 
+IPF_TOL = 1e-3      # with LENGTH_REF_UM set: _ipf_fast stops once no finite log-factor (q, a) changes by more than this
+                    # between iterations (same fixed point, fewer iterations); None or the published path: fixed count
+IPF_LOG = []        # iterations used per _ipf_fast call (diagnostic)
+
+
 def _ipf_fast(X, U, fk, cnt, a, iters):
     torch = _torch()
-    for _ in range(iters):
+    tol = IPF_TOL if LENGTH_REF_UM is not None else None
+    q_prev = None; n = 0
+    for n in range(1, iters + 1):
         q = torch.log(cnt.Nr) - torch.log(fk.row_sums(X, U, torch.exp(a)))
-        a = torch.log(cnt.Ns) - torch.log(fk.col_sums(X, U, torch.exp(q)))
-        a = a - a[torch.isfinite(a)].mean()
+        a_new = torch.log(cnt.Ns) - torch.log(fk.col_sums(X, U, torch.exp(q)))
+        a_new = a_new - a_new[torch.isfinite(a_new)].mean()
+        if tol is not None and q_prev is not None:
+            dq = (q - q_prev)[torch.isfinite(q) & torch.isfinite(q_prev)].abs().max()
+            da = (a_new - a)[torch.isfinite(a_new) & torch.isfinite(a)].abs().max()
+            a = a_new
+            if float(torch.maximum(dq, da)) < tol:
+                break
+        else:
+            a = a_new
+        q_prev = q
+    IPF_LOG.append(n)
     return q, a
 
 
@@ -1856,7 +1977,7 @@ def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", ver
                 q, a = _ipf_fast(Xc, Uc, fk, cnt, a, IPF_WARM_ITERS)
         warp = _Warp(lo, hi, spacing, dev, init_field=warp)
         opt = torch.optim.Adam([warp.D], lr=lr)
-        compiled = (WARP_COMPILE and dev.type == "cuda" and not cnt.shared and not cnt.host and isinstance(footprint, str)
+        compiled = (WARP_COMPILE and dev.type == "cuda" and not cnt.shared and not cnt.host and fk.nb is not None and isinstance(footprint, str)
                     and footprint == "disc" and KDE_FFT and not EDGE_CORRECT and ANNEAL <= 0)
         for it in range(steps):
             if compiled:
