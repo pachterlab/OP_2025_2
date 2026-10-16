@@ -111,9 +111,14 @@ FAST_COMPILE = True   # fuse the per-pair likelihood terms with torch.compile on
 FAST_COMPILE_CPU = True   # the same on CPU tensors
 
 
-def _maybe_compiled(fn):
+COMPILE_CACHE_LIMIT = 64   # torch._dynamo recompile limit per function (default 8): past it a function silently runs eager
+                           # for the rest of the process (seen when a multilevel start ran in-process before a large run)
+
+
+def _maybe_compiled(fn, dynamic=False):
     """fn, compiled with torch.compile on first use (CUDA, or CPU with FAST_COMPILE_CPU); eager otherwise, and
-    eager for good if compilation fails (results agree to floating-point rounding)."""
+    eager for good if compilation fails (results agree to floating-point rounding). dynamic=True: one compiled version
+    for all input sizes (functions called on arrays of many sizes, e.g. the cell near sums across multilevel levels)."""
     state = {}
 
     def call(*args):
@@ -124,7 +129,9 @@ def _maybe_compiled(fn):
             if FAST_COMPILE and args[0].is_cuda:
                 try:
                     import triton  # noqa: F401  (torch.compile's GPU backend)
-                    f = torch.compile(fn)
+                    import torch._dynamo
+                    torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, COMPILE_CACHE_LIMIT)
+                    f = torch.compile(fn, dynamic=True) if dynamic else torch.compile(fn)
                 except Exception:
                     f = fn
             elif FAST_COMPILE_CPU and not args[0].is_cuda:
@@ -677,6 +684,10 @@ def refine(X, U, C, tab, c, q, a):
 COUNTS_ON_HOST = None          # nonzero counts kept in pinned CPU memory and streamed to the device in NNZ_CHUNK pieces;
                                # None: only with LENGTH_REF_UM set and more than COUNTS_HOST_ABOVE nonzeros (large arrays)
 COUNTS_HOST_ABOVE = 100_000_000
+COUNTS_COMPACT = None          # counts that would be streamed are kept on the device in compact form (CSR row pointer, int32
+                               # columns, int16 values) when they fit in COMPACT_GPU_FRACTION of the device memory; True: force;
+                               # False: never (stream)
+COMPACT_GPU_FRACTION = 0.35
 
 
 class _Counts:
@@ -691,8 +702,23 @@ class _Counts:
         self.dev = torch.device(dev) if not isinstance(dev, torch.device) else dev
         self.host = (COUNTS_ON_HOST if COUNTS_ON_HOST is not None
                      else (LENGTH_REF_UM is not None and coo.nnz > COUNTS_HOST_ABOVE))
+        self.compact = False
+        if self.host and COUNTS_ON_HOST is None and self.dev.type == "cuda" and COUNTS_COMPACT is not False:
+            # compact device storage instead of streaming, if it fits: rows implicit (CSR row pointer), int32 columns,
+            # int16 values (~6 bytes per count)
+            csr = Csp.tocsr()
+            need = csr.nnz * 6 + (csr.shape[0] + 1) * 8
+            fits = need <= COMPACT_GPU_FRACTION * torch.cuda.get_device_properties(self.dev).total_memory
+            if COUNTS_COMPACT or (fits and (csr.nnz == 0 or float(csr.data.max()) <= 32767)):
+                self.host, self.compact = False, True
+                self.indptr = torch.tensor(csr.indptr, dtype=torch.long, device=dev)
+                self.cols = torch.tensor(csr.indices, dtype=torch.int32, device=dev)
+                self.vals = torch.tensor(np.minimum(csr.data, 32767), dtype=torch.int16, device=dev)
+                self.rows = None
         idt = torch.int32 if LENGTH_REF_UM is not None else torch.long     # large arrays: half the index memory
-        if self.host:
+        if self.compact:
+            pass
+        elif self.host:
             pin = self.dev.type == "cuda"
             self.rows = torch.tensor(coo.row, dtype=idt); self.cols = torch.tensor(coo.col, dtype=idt)
             self.vals = torch.tensor(coo.data, dtype=torch.float32)
@@ -709,8 +735,15 @@ class _Counts:
 
     def chunks(self, size=None):
         """(rows, cols, vals) on the device, NNZ_CHUNK nonzeros at a time (copied from pinned memory if host)."""
+        torch = _torch()
         size = size or NNZ_CHUNK
         for j in range(0, len(self.vals), size):
+            if self.compact:                           # rows from the CSR row pointer; values to float32
+                k = min(size, len(self.vals) - j)
+                idx = torch.arange(j, j + k, device=self.dev)
+                r = (torch.searchsorted(self.indptr, idx, right=True) - 1).int()
+                yield r, self.cols[j:j + k], self.vals[j:j + k].float()
+                continue
             r, o, v = self.rows[j:j + size], self.cols[j:j + size], self.vals[j:j + size]
             if self.host:
                 r, o, v = (t.to(self.dev, non_blocking=True) for t in (r, o, v))
@@ -1224,8 +1257,8 @@ def _cell_cols_eager(X, U, R, Rm, S, Sm, v, tab, c, shared):
     return (_cell_k_eager(X[R], U[S], ok, tab, c) * v[R][:, :, None]).sum(1)
 
 
-_cell_rows = _maybe_compiled(_cell_rows_eager)
-_cell_cols = _maybe_compiled(_cell_cols_eager)
+_cell_rows = _maybe_compiled(_cell_rows_eager, dynamic=True)
+_cell_cols = _maybe_compiled(_cell_cols_eager, dynamic=True)
 
 
 def _cell_kd_eager(Xr, Us, ok, tab):
@@ -1266,8 +1299,8 @@ def _cell_cols_grad_eager(X, U, R, Rm, S, Sm, v, tab, shared, g):
     return coef.sum(2), -coef.sum(1), (go[:, None, :] * k).sum(2)
 
 
-_cell_rows_grad = _maybe_compiled(_cell_rows_grad_eager)
-_cell_cols_grad = _maybe_compiled(_cell_cols_grad_eager)
+_cell_rows_grad = _maybe_compiled(_cell_rows_grad_eager, dynamic=True)
+_cell_cols_grad = _maybe_compiled(_cell_cols_grad_eager, dynamic=True)
 
 
 def _cell_batches(R, Rm, S, Sm):
@@ -1424,6 +1457,59 @@ def _obs_term_eager(X, U, rows, cols, vals, tab, c):
     return (vals * torch.log(tab[i] * (1 - t) + tab[i + 1] * t + c)).sum()
 
 
+OBS_CHUNK = 16_000_000   # nonzero counts per batch of the analytic observed term (large arrays)
+
+
+def _obs_vg_eager(X, U, rows, cols, vals, tab, c):
+    """Observed term of one batch, sum C log m(d), and its gradient per entry w.r.t. x_row (minus it for u_col), analytic
+    (the derivative autograd would take of _obs_term_eager)."""
+    torch = _torch()
+    D = X[rows] - U[cols]
+    d = torch.sqrt((D ** 2).sum(-1) + 1e-4)
+    fr = d / TAB_STEP; hi = tab.shape[0] - 1.001
+    f = fr.clamp(0, hi); i = f.floor().long(); t = f - i
+    m = tab[i] * (1 - t) + tab[i + 1] * t + c
+    dm = torch.where((fr > 0) & (fr < hi), (tab[i + 1] - tab[i]) / TAB_STEP, torch.zeros((), dtype=m.dtype, device=m.device))
+    return (vals * torch.log(m)).sum(), (vals * dm / (m * d))[:, None] * D
+
+
+_obs_vg = _maybe_compiled(_obs_vg_eager, dynamic=True)
+_OBS_FN = None
+
+
+def _obs_fast():
+    return LENGTH_REF_UM is not None and WIDTH is None
+
+
+def _obs_fn():
+    """torch.autograd.Function: the observed term over all counts (device-resident or streamed), value and gradient
+    computed together in OBS_CHUNK batches during the forward pass; backward scales the stored gradient."""
+    global _OBS_FN
+    if _OBS_FN is not None:
+        return _OBS_FN
+    torch = _torch()
+
+    class ObsTerm(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, X, U, tab, c, cnt):
+            gX, gU = torch.zeros_like(X), torch.zeros_like(U)
+            val = torch.zeros((), dtype=X.dtype, device=X.device)
+            with torch.no_grad():
+                for r, o, v in cnt.chunks(OBS_CHUNK):
+                    vv, g = _obs_vg(X, U, r, o, v, tab, c)
+                    val = val + vv; gX.index_add_(0, r, g); gU.index_add_(0, o, -g)
+            ctx.save_for_backward(gX, gU)
+            return val
+
+        @staticmethod
+        def backward(ctx, gout):
+            gX, gU = ctx.saved_tensors
+            return gout * gX, gout * gU, None, None, None
+
+    _OBS_FN = ObsTerm
+    return ObsTerm
+
+
 NEAR_CHUNK_ABOVE = 20_000_000   # with WIDTH or LENGTH_REF_UM set: near pairs above which the near sum is chunked +
                                 # checkpointed (per-pair temporaries of one chunk at a time; memory)
 
@@ -1499,17 +1585,23 @@ def _ll_and_grad_fast(X0, U0, warp, cnt, q, a, fk, tab, c):
         assert not JOINT_WIDTH, "JOINT_WIDTH needs device-resident counts"
         Xd = X.detach().requires_grad_(True); Ud = Xd if cnt.shared else U.detach().requires_grad_(True)
         ((torch.exp(q) * fk.row_sums(Xd, Ud, torch.exp(a))).sum() / 1e6).backward()
-        for r, o, v in cnt.chunks():
-            (-_obs_term(Xd, Ud, r, o, v, tab, fk.ct) / 1e6).backward()
+        if _obs_fast():                         # large arrays: value + analytic gradient in large batches
+            (-_obs_fn().apply(Xd, Ud, tab, fk.ct, cnt) / 1e6).backward()
+        else:
+            for r, o, v in cnt.chunks():
+                (-_obs_term(Xd, Ud, r, o, v, tab, fk.ct) / 1e6).backward()
         if cnt.shared:
             torch.autograd.backward([X], [Xd.grad])
         else:
             torch.autograd.backward([X, U], [Xd.grad, Ud.grad])
         return
     loss = (torch.exp(q) * fk.row_sums(X, U, torch.exp(a))).sum()
-    for j in range(0, len(cnt.vals), NNZ_CHUNK):
-        loss = loss - _obs_term(X, U, cnt.rows[j:j + NNZ_CHUNK], cnt.cols[j:j + NNZ_CHUNK], cnt.vals[j:j + NNZ_CHUNK],
-                                tab, fk.ct)
+    if _obs_fast():
+        loss = loss - _obs_fn().apply(X, U, tab, fk.ct, cnt)
+    else:
+        for j in range(0, len(cnt.vals), NNZ_CHUNK):
+            loss = loss - _obs_term(X, U, cnt.rows[j:j + NNZ_CHUNK], cnt.cols[j:j + NNZ_CHUNK], cnt.vals[j:j + NNZ_CHUNK],
+                                    tab, fk.ct)
     (loss / 1e6).backward()
 
 
@@ -1541,6 +1633,7 @@ def _far_w():
     return WIDTH ** (WIDTH_BETA / 2)
 
 KFIT_CHUNK_ABOVE = 50_000_000   # nonzero + near pairs above which the kernel-fit terms are chunked and checkpointed
+KFIT_CHUNK_ABOVE_LARGE = 10_000_000   # the same with LENGTH_REF_UM set (18 mm shared: unchunked fit of ~45M entries peaked at 5.6 GB)
                                 # (same values; bounds memory on large arrays). Every paper dataset is below it.
 
 
@@ -1579,10 +1672,13 @@ class _RowSubset:
 
     def __init__(self, cnt, sel):
         torch = _torch()
-        dev = sel.device; src = cnt.rows.device; s_ = sel.to(src)
-        pos = torch.full((cnt.n_r,), -1, dtype=torch.long, device=src); pos[s_] = torch.arange(len(sel), device=src)
-        keep = pos[cnt.rows.long()] >= 0
-        self.rows = pos[cnt.rows[keep].long()].to(dev); self.cols = cnt.cols[keep].to(dev); self.vals = cnt.vals[keep].to(dev)
+        dev = sel.device
+        pos = torch.full((cnt.n_r,), -1, dtype=torch.long, device=dev); pos[sel] = torch.arange(len(sel), device=dev)
+        rr, oo, vv = [], [], []
+        for r, o, v in cnt.chunks():                    # any storage (device, compact, host): batch by batch
+            p_ = pos[r.long()]; k = p_ >= 0
+            rr.append(p_[k]); oo.append(o[k].long()); vv.append(v[k].float())
+        self.rows, self.cols, self.vals = torch.cat(rr), torch.cat(oo), torch.cat(vv)
         self.Nr, self.Ns = cnt.Nr[sel], cnt.Ns
         self.n_r, self.n_o, self.shared, self.sel, self.host = len(sel), cnt.n_o, cnt.shared, sel, False
 
@@ -1593,13 +1689,13 @@ def fit_kernel_fast(X, U, cnt, dev, iters=300, lr=0.05, decay=False):
     mesh (the kernel image is re-transformed every step, differentiably)."""
     torch = _torch()
     k = KFIT_ROWS if KFIT_ROWS is not None else (KFIT_ROWS_LARGE if LENGTH_REF_UM is not None else None)
-    if ((k is not None and cnt.n_r > k) or cnt.host) and WIDTH is None:   # (per-bead widths are indexed by bead: no subset)
+    if ((k is not None and cnt.n_r > k) or cnt.host or getattr(cnt, "compact", False)) and WIDTH is None:   # (per-bead widths are indexed by bead: no subset)
         g = torch.Generator(device="cpu").manual_seed(0)        # host-resident counts: device copy of (a subset of) rows
         sel = torch.randperm(cnt.n_r, generator=g)[:min(k or cnt.n_r, cnt.n_r)].sort().values.to(dev)
         if cnt.shared:
             U = X                                      # every bead stays a sender
         X, cnt = X[sel], _RowSubset(cnt, sel)
-    assert not cnt.host, "kernel fit on host-resident counts needs the receiver subset (KFIT_ROWS; not with WIDTH)"
+    assert not (cnt.host or getattr(cnt, "compact", False)), "kernel fit on streamed/compact counts needs the receiver subset (KFIT_ROWS; not with WIDTH)"
     logk = torch.tensor(np.log(KNOTS), dtype=torch.float32, device=dev)
     shared = cnt.shared
     sel = getattr(cnt, "sel", None)
@@ -1626,7 +1722,8 @@ def fit_kernel_fast(X, U, cnt, dev, iters=300, lr=0.05, decay=False):
     opt = torch.optim.Adam([a, q, w, logc], lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=iters) if decay else None
     norm = float(cnt.n_r) * float(cnt.n_o)
-    terms = _kfit_terms_chunked if len(cnt.vals) + len(nb) > KFIT_CHUNK_ABOVE else _kfit_terms
+    chunk_above = KFIT_CHUNK_ABOVE if LENGTH_REF_UM is None else KFIT_CHUNK_ABOVE_LARGE
+    terms = _kfit_terms_chunked if len(cnt.vals) + len(nb) > chunk_above else _kfit_terms
     for _ in range(iters):
         opt.zero_grad(set_to_none=True)
         v = _knot_values(w); c = torch.exp(logc); ac = a - a.mean(); ea = torch.exp(ac)
@@ -1774,6 +1871,15 @@ def isotropy_penalty(X, Uo, ri, oi, lo, hi, weights=None):
     if weights is None:
         weights = _iso_weights(0.5 * (X[ri] + Uo[oi]), lo, hi, X.device)
     return _patch_anisotropy_w(comp, weights)
+
+
+def anisotropy_stretch_pct(penalty, floor):
+    """Physical size of contact anisotropy: the excess doubled-angle resultant r = sqrt(max(penalty - floor, 0)) read as a
+    uniaxial local stretch s = sqrt((1 + r) / (1 - r)) (contacts stretched by s along one axis have r ~ (s^2 - 1) / (s^2 + 1));
+    returned as percent (s - 1) * 100. Unlike penalty / floor, it does not grow with depth and array size (the floor shrinks
+    with the number of contacts, so large or deep arrays show large ratios for small distortions)."""
+    r = min(float(np.sqrt(max(penalty - floor, 0.0))), 0.99)
+    return 100.0 * (np.sqrt((1 + r) / (1 - r)) - 1.0)
 
 
 def isotropy_noise_floor(X, Uo, ri, oi, lo, hi, draws=5, seed=0):
@@ -1977,7 +2083,7 @@ def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", ver
                 q, a = _ipf_fast(Xc, Uc, fk, cnt, a, IPF_WARM_ITERS)
         warp = _Warp(lo, hi, spacing, dev, init_field=warp)
         opt = torch.optim.Adam([warp.D], lr=lr)
-        compiled = (WARP_COMPILE and dev.type == "cuda" and not cnt.shared and not cnt.host and fk.nb is not None and isinstance(footprint, str)
+        compiled = (WARP_COMPILE and dev.type == "cuda" and not cnt.shared and not cnt.host and not cnt.compact and fk.nb is not None and isinstance(footprint, str)
                     and footprint == "disc" and KDE_FFT and not EDGE_CORRECT and ANNEAL <= 0)
         for it in range(steps):
             if compiled:
@@ -2406,11 +2512,13 @@ def _reconstruct_general(Csr, receivers_init, array_diameter, phi, lam, device, 
             floor = isotropy_noise_floor(X, X if shared else U, rr, oo, lo_, hi_)
             mv = float((X - prevX).norm(dim=1).median()) if prevX is not None else float("nan")
             Xo = np.full((Csr.shape[0], 2), np.nan, np.float32); Xo[r_ok] = X.cpu().numpy() / s
-            plog.append({"penalty": pen, "floor": floor, "moved": mv, "contacts": int(len(rr)), "receivers": Xo})
+            st = anisotropy_stretch_pct(pen, floor)
+            plog.append({"penalty": pen, "floor": floor, "stretch_pct": st, "moved": mv, "contacts": int(len(rr)), "receivers": Xo})
             prevX = X.clone()
             if verbose:
                 print(f"  pass {len(plog)}: contact anisotropy / sampling floor = {pen / floor:.2f} "
-                      "(a correct layout is about 1)", flush=True)
+                      f"(a correct layout is about 1; the ratio grows with depth and array size), excess ~ {st:.1f}% local stretch",
+                      flush=True)
 
     if plog is not None:
         _log_pass()
@@ -2483,7 +2591,7 @@ def _contact_anisotropy_impl(counts, receivers, senders, array_diameter, device=
     """Anisotropy of contact directions in a layout, relative to the level expected from sampling alone (random
     directions). About 1 for a correct layout of an isotropic array; well above 1 indicates shear. Contacts are
     chosen as accumap's isotropy prior chooses them (kernel and abundances fit at these positions).
-    Returns {"penalty", "floor", "ratio", "contacts"}."""
+    Returns {"penalty", "floor", "ratio", "stretch_pct" (anisotropy_stretch_pct), "contacts"}."""
     torch = _torch()
     Cf, X, U, cnt, dev = _fixed_layout(counts, receivers, senders, array_diameter, device)
     v, c = fit_kernel_fast(X, U, cnt, dev)
@@ -2495,7 +2603,7 @@ def _contact_anisotropy_impl(counts, receivers, senders, array_diameter, device=
     with torch.no_grad():
         pen = float(isotropy_penalty(X, U, ri, oi, lo, hi))
     fl = isotropy_noise_floor(X, U, ri, oi, lo, hi)
-    return {"penalty": pen, "floor": fl, "ratio": pen / fl, "contacts": int(len(ri))}
+    return {"penalty": pen, "floor": fl, "ratio": pen / fl, "stretch_pct": anisotropy_stretch_pct(pen, fl), "contacts": int(len(ri))}
 
 
 def umap_layout(counts, seed=0, shared=False, n_epochs=400, fast=False, backend="umap-learn"):
