@@ -89,6 +89,7 @@ REFINE_WINDOWS = (15, 10)
 TAB_STEP, TAB_MAX = 0.5, 4000.0
 GRID = 5.0                     # normalizer grid for per-bead refinement
 BUDGET = 40_000_000            # max elements per refinement batch tensor
+BUDGET_LARGE = 160_000_000     # the same with LENGTH_REF_UM set (fewer, larger batches; 18 mm shared: _side_ll 434 -> 348 s)
 CHUNK = 800                    # receiver rows per likelihood chunk
 DENSE_FP32_BYTES = 1.5e9       # hold counts / kernel matrix densely in float32 up to this size
 DENSE_FP16_BYTES = 3.5e9       # general path: kernel matrix in float16 up to this size, else recomputed
@@ -857,16 +858,50 @@ def warp_stage_general(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", 
         return X, (X if cnt.shared else U0 + warp(U0)), q, a
 
 
+_PAD_NB = None
+PAD_NUMBA = False   # numba multithreaded gather for _CSRPad: slower than the torch path on the 18 mm test (280 vs 106 s;
+                    # thread contention with torch); kept for testing
+
+
+def _pad_gather_nb():
+    """numba-compiled, multithreaded gather of padded CSR rows (None if numba is unavailable or PAD_NUMBA is off)."""
+    global _PAD_NB
+    if not PAD_NUMBA:
+        return None
+    if _PAD_NB is None:
+        try:
+            from numba import njit, prange
+
+            @njit(parallel=True, cache=True)
+            def gather(indptr, arr, rows, k, out):
+                for b in prange(len(rows)):
+                    a = indptr[rows[b]]; n = min(indptr[rows[b] + 1] - a, k)
+                    for t in range(n):
+                        out[b, t] = arr[a + t]
+            _PAD_NB = gather
+        except Exception:
+            _PAD_NB = False
+    return _PAD_NB or None
+
+
 class _CSRPad:
     """Padded view of CSR rows without materializing the padded table: pad[rows, :k] gives (len(rows), k) partner
-    indices (field="indices") or counts (field="data"), zero beyond each row's length (as the padded table)."""
+    indices (field="indices") or counts (field="data"), zero beyond each row's length (as the padded table).
+    With PAD_NUMBA, a numba multithreaded gather (when available)."""
 
     def __init__(self, indptr, arr):
         self.indptr, self.arr = indptr, arr
+        self.np_indptr, self.np_arr = indptr.numpy(), arr.numpy()
 
     def __getitem__(self, key):
         torch = _torch()
         rows, sl = key
+        g = _pad_gather_nb()
+        if g is not None:
+            k = sl.stop
+            out = np.zeros((len(rows), k), dtype=self.np_arr.dtype)
+            g(self.np_indptr, self.np_arr, np.asarray(rows, dtype=np.int64), int(k), out)
+            return torch.from_numpy(out)
         k = sl.stop
         start = self.indptr[rows]; ln = self.indptr[rows + 1] - start
         pos = start[:, None] + torch.arange(k)[None, :]
@@ -938,12 +973,21 @@ def _side_ll(Pos, pad, N, Other, w_other, G, tab, c, self_w=None, mG=None, repel
     Ctr = Pos if center is None else center
     ct = torch.as_tensor(float(c), dtype=torch.float32, device=dev)
     out = torch.empty(len(Pos), nc, device=dev)
+    budget = BUDGET if LENGTH_REF_UM is None else BUDGET_LARGE
+    nz_sorted = np.maximum(np.asarray(nnz)[order], 1)       # order sorts rows by length: a batch's widest row is its last
     i = 0
     while i < len(order):
-        j = i
-        while j < len(order) and (j - i + 1) * nc * max(int(nnz[order[j]]), 1) <= BUDGET:
-            j += 1
-        j = max(j, i + 1)
+        lo_, hi_ = i + 1, len(order)                        # largest j with (j - i) * nc * nz_sorted[j - 1] <= budget
+        if (hi_ - i) * nc * int(nz_sorted[hi_ - 1]) <= budget:
+            j = hi_
+        else:
+            while lo_ < hi_:
+                mid = (lo_ + hi_ + 1) // 2
+                if (mid - i) * nc * int(nz_sorted[mid - 1]) <= budget:
+                    lo_ = mid
+                else:
+                    hi_ = mid - 1
+            j = max(lo_, i + 1)
         rows_c = torch.tensor(order[i:j])
         rows = rows_c.to(dev)
         kmax = max(int(nnz[rows_c].max()), 1)
