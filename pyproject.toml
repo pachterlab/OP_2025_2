@@ -16,7 +16,11 @@ dependencies = [
     "umap-learn",
     "torch",
     "editdistance",
+    "matplotlib",
 ]
+
+[project.optional-dependencies]
+fast = ["numba"]   # compiled loops in accumap.multilevel (pure Python otherwise)
 
 [tool.setuptools.packages.find]
 where = ["src"]
