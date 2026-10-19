@@ -21,6 +21,8 @@ given in the same units as the returned coordinates.
 
 Requires torch (CUDA strongly recommended; CPU works but is slow).
 """
+import contextlib
+import threading
 import time
 import numpy as np
 
@@ -116,6 +118,9 @@ COMPILE_CACHE_LIMIT = 64   # torch._dynamo recompile limit per function (default
                            # for the rest of the process (seen when a multilevel start ran in-process before a large run)
 
 
+_COMPILE_LOCK = threading.Lock()
+
+
 def _maybe_compiled(fn, dynamic=False):
     """fn, compiled with torch.compile on first use (CUDA, or CPU with FAST_COMPILE_CPU); eager otherwise, and
     eager for good if compilation fails (results agree to floating-point rounding). dynamic=True: one compiled version
@@ -144,10 +149,14 @@ def _maybe_compiled(fn, dynamic=False):
         if f is fn:
             return fn(*args)
         try:
+            if MULTI_GPU:                       # device threads: compilation (and recompiles) must not interleave
+                with _COMPILE_LOCK:
+                    return f(*args)
             return f(*args)
         except Exception as e:
             import warnings
-            warnings.warn(f"accumap: torch.compile failed ({type(e).__name__}); using eager PyTorch")
+            warnings.warn(f"accumap: torch.compile failed for {fn.__name__} ({type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''}); "
+                          "using eager PyTorch")
             state["f"] = fn
             return fn(*args)
     return call
@@ -294,6 +303,14 @@ def _ll_and_grad(X0, U0, warp, Ct, q, a, tab, c):
         (-((Ct[i:i + CHUNK] * eta).sum() - torch.exp(eta).sum()) / 1e6).backward()
 
 
+DENSITY_FLOOR = 1e-8   # density floored at this fraction of its mean before the log (grid points the KDE does not reach,
+                       # e.g. footprint corners beyond a coarse layout, would give log 0; values above the floor are unchanged)
+
+
+def _density_floor(rho):
+    return rho.clamp(min=DENSITY_FLOOR * float(rho.detach().mean()))
+
+
 def density_penalty(P, footprint="disc", posed=None):
     """Squared deviation of log local bead density from its mean, summed over a grid
     inside the footprint, at bandwidths HS. Also returns each bandwidth's relative SD of density.
@@ -314,7 +331,7 @@ def density_penalty(P, footprint="disc", posed=None):
         G = torch.stack(torch.meshgrid(g, g, indexing="ij"), -1).reshape(-1, 2)
         G = G[G.norm(dim=1) < R] + c
         rho = _kde(G, P, h)            # all pairs (exact path) or FFT (fast path)
-        lr = torch.log(rho)
+        lr = torch.log(_density_floor(rho))
         if EDGE_CORRECT:
             with torch.no_grad():
                 r99 = float(torch.quantile((P - c).norm(dim=1), EDGE_SUPPORT))
@@ -365,7 +382,7 @@ def _density_penalty_cached(P, geom):
     pen = 0.0
     w = torch.ones(len(P), device=P.device, dtype=P.dtype)
     for G, M in geom:
-        lr = torch.log(M.sample(M.convolve(M.spread(P, w)), G))
+        lr = torch.log(_density_floor(M.sample(M.convolve(M.spread(P, w)), G)))
         pen = pen + ((lr - lr.mean()) ** 2).sum()
     return pen, []
 
@@ -466,7 +483,7 @@ def _density_penalty_polygon(P, poly, posed=None):
         if EDGE_CORRECT and support is None:
             support = _pose_polygon(P, np.asarray(poly, np.float64), frac=EDGE_SUPPORT)
         lo, hi = posed.min(0) - 10, posed.max(0) + 10
-    pen, sds = 0.0, []
+    pen, sds, n_ref = 0.0, [], None
     for h in HS:
         step = h / 2
         gx = np.arange(lo[0], hi[0] + step, step); gy = np.arange(lo[1], hi[1] + step, step)
@@ -474,14 +491,34 @@ def _density_penalty_polygon(P, poly, posed=None):
         inside = Path(posed).contains_points(np.c_[GX.ravel(), GY.ravel()]).reshape(GX.shape)
         G = torch.tensor(np.c_[GX[inside], GY[inside]], dtype=P.dtype, device=P.device)
         rho = _kde(G, P, h)
-        lr = torch.log(rho)
+        lr = torch.log(_density_floor(rho))
         if EDGE_CORRECT:
             with torch.no_grad():
                 lr_k = torch.log(_edge_kappa(G, support, h))
             lr = lr - lr_k
         pen = pen + ((lr - lr.mean()) ** 2).sum()
         sds.append(float((rho.std() / rho.mean()).detach()))
+        n_ref = len(G) if n_ref is None else n_ref
+    if COVERAGE_FRACS:                                 # wide, edge-corrected bandwidths: empty footprint regions far from beads
+        with torch.no_grad():
+            cov_support = support if support is not None else _pose_polygon(P, np.asarray(poly, np.float64), frac=EDGE_SUPPORT)
+            V = posed - posed.mean(0); short = float(np.sqrt(np.linalg.eigvalsh(np.cov(V.T))[0]) * 2 * np.sqrt(3))
+        for f in COVERAGE_FRACS:
+            h = f * short; step = h / 4
+            gx = np.arange(lo[0], hi[0] + step, step); gy = np.arange(lo[1], hi[1] + step, step)
+            GX, GY = np.meshgrid(gx, gy, indexing="ij")
+            inside = Path(posed).contains_points(np.c_[GX.ravel(), GY.ravel()]).reshape(GX.shape)
+            G = torch.tensor(np.c_[GX[inside], GY[inside]], dtype=P.dtype, device=P.device)
+            with torch.no_grad():
+                lk = torch.log(_density_floor(_edge_kappa(G, cov_support, h)))
+            lr = torch.log(_density_floor(_kde(G, P, h))) - lk
+            pen = pen + COVERAGE_WEIGHT * n_ref * ((lr - lr.mean()) ** 2).mean()
     return pen, sds
+
+
+COVERAGE_FRACS = ()     # extra density-prior bandwidths (fractions of the posed footprint's short side) with edge correction,
+COVERAGE_WEIGHT = 1.0   # polygon footprints only: see empty footprint regions (e.g. corners left by a bent layout) that the
+                        # HS bandwidths do not reach; weight relative to one HS bandwidth's penalty. () = off (published path)
 
 
 def _density_penalty_auto(P):
@@ -507,7 +544,7 @@ def _density_penalty_auto(P):
         iy = ((G[:, 1] - lo[1]) / step).round().long().clamp(0, len(gy) - 1)
         G = G[mask[ix, iy]]
         rho = _kde(G, P, h)
-        lr = torch.log(rho)
+        lr = torch.log(_density_floor(rho))
         pen = pen + ((lr - lr.mean()) ** 2).sum()
         sds.append(float((rho.std() / rho.mean()).detach()))
     return pen, sds
@@ -689,6 +726,59 @@ COUNTS_COMPACT = None          # counts that would be streamed are kept on the d
                                # columns, int16 values) when they fit in COMPACT_GPU_FRACTION of the device memory; True: force;
                                # False: never (stream)
 COMPACT_GPU_FRACTION = 0.35
+MULTI_GPU = None               # with LENGTH_REF_UM set: list of CUDA devices (e.g. ["cuda:0", "cuda:1"]) sharing the warp's observed
+                               # and near expected terms; each holds a compact share of the counts, the full matrix stays in pinned
+                               # host memory for the rest. None: one device
+
+
+_DEV_POOL = None
+
+
+def _on_devices(work, K):
+    """[work(k) for k in range(K)], one host thread per device (host-side syncs in one device's work then do not
+    serialize the others)."""
+    global _DEV_POOL
+    if K == 1:
+        return [work(0)]
+    if _DEV_POOL is None or _DEV_POOL._max_workers < K:
+        from concurrent.futures import ThreadPoolExecutor
+        _DEV_POOL = ThreadPoolExecutor(K)
+    return [f.result() for f in [_DEV_POOL.submit(work, k) for k in range(K)]]
+
+
+MULTI_GPU_RESERVE_GB = (5.5, 4.0)   # device memory kept free of resident counts with MULTI_GPU: (main device, others); a device's
+                                    # share of the counts beyond its free memory minus this is streamed from pinned host memory (eye-chart
+                                    # size, 1.2M beads: 2.5 GB on the second device ran out in the near-term cell lists)
+
+
+class _CountPart:
+    """A contiguous block of rows [r0, r1) of the counts, compact (CSR row pointer, int32 columns, int16 values) on its
+    compute device, or (on_host) in pinned host memory, copied to the device chunk by chunk (row pointer on the device)."""
+
+    def __init__(self, csr, r0, r1, dev, on_host=False):
+        torch = _torch()
+        a, b = csr.indptr[r0], csr.indptr[r1]
+        self.r0, self.dev, self.n, self.on_host = r0, torch.device(dev), int(b - a), on_host
+        self.indptr = torch.tensor(csr.indptr[r0:r1 + 1] - a, dtype=torch.long, device=dev)
+        d = csr.data[a:b]
+        vdt = torch.int16 if (len(d) == 0 or d.max() <= 32767) else torch.float32
+        if on_host:
+            self.cols = torch.from_numpy(np.ascontiguousarray(csr.indices[a:b], dtype=np.int32)).pin_memory()
+            self.vals = torch.tensor(d, dtype=vdt).pin_memory()
+        else:
+            self.cols = torch.tensor(csr.indices[a:b], dtype=torch.int32, device=dev)
+            self.vals = torch.tensor(d, dtype=vdt, device=dev)
+
+    def chunks(self, size):
+        torch = _torch()
+        for j in range(0, self.n, size):
+            k = min(size, self.n - j)
+            idx = torch.arange(j, j + k, device=self.dev)
+            r = (torch.searchsorted(self.indptr, idx, right=True) - 1 + self.r0).int()
+            o, v = self.cols[j:j + k], self.vals[j:j + k]
+            if self.on_host:
+                o, v = o.to(self.dev, non_blocking=True), v.to(self.dev, non_blocking=True)
+            yield r, o, v.float()
 
 
 class _Counts:
@@ -704,7 +794,13 @@ class _Counts:
         self.host = (COUNTS_ON_HOST if COUNTS_ON_HOST is not None
                      else (LENGTH_REF_UM is not None and coo.nnz > COUNTS_HOST_ABOVE))
         self.compact = False
-        if self.host and COUNTS_ON_HOST is None and self.dev.type == "cuda" and COUNTS_COMPACT is not False:
+        self.parts, self._csr = None, None
+        if MULTI_GPU and LENGTH_REF_UM is not None and self.dev.type == "cuda":
+            # counts split by rows into equal-nnz shares, compact on each device; the full matrix in pinned host memory
+            self._csr = Csp.tocsr()
+            self._build_parts()
+            self.host = True
+        if self.host and COUNTS_ON_HOST is None and self.dev.type == "cuda" and COUNTS_COMPACT is not False and self.parts is None:
             # compact device storage instead of streaming, if it fits: rows implicit (CSR row pointer), int32 columns,
             # int16 values (~6 bytes per count)
             csr = Csp.tocsr()
@@ -733,6 +829,40 @@ class _Counts:
         self.Ns = torch.tensor(np.asarray(Csp.sum(0)).ravel(), dtype=torch.float32, device=dev)
         size = self.n_r * self.n_o
         self.kernel_store = "fp32" if size * 4 <= DENSE_FP32_BYTES else ("fp16" if size * 2 <= DENSE_FP16_BYTES else "chunked")
+
+    def _build_parts(self):
+        """MULTI_GPU count shares: rows split into equal-nnz blocks, one per device; each device keeps resident what fits
+        (free memory - MULTI_GPU_RESERVE_GB), the rest of its block is streamed from pinned host memory."""
+        torch = _torch()
+        csr = self._csr; K = len(MULTI_GPU)
+        cuts = [0] + [int(np.searchsorted(csr.indptr, csr.nnz * k / K)) for k in range(1, K)] + [csr.shape[0]]
+        self.parts = []                                # each device: resident rows first, the rest (if any) streamed
+        for k in range(K):
+            d = torch.device(MULTI_GPU[k])
+            free = torch.cuda.mem_get_info(d)[0] + torch.cuda.memory_reserved(d) - torch.cuda.memory_allocated(d)
+            keep = free - MULTI_GPU_RESERVE_GB[0 if d == self.dev else 1] * 1e9
+            a = csr.indptr[cuts[k]]
+            cap = max(int(keep // 6), 0)                # ~6 bytes per resident count
+            split = int(np.searchsorted(csr.indptr, a + cap, side="right")) - 1
+            split = min(max(split, cuts[k]), cuts[k + 1])
+            if split > cuts[k]:
+                self.parts.append(_CountPart(csr, cuts[k], split, d))
+            if split < cuts[k + 1]:
+                self.parts.append(_CountPart(csr, split, cuts[k + 1], d, on_host=True))
+        self.streamed_frac = sum(p.n for p in self.parts if p.on_host) / max(csr.nnz, 1)
+
+    def release_parts(self):
+        """Free the MULTI_GPU count shares (used by the warp only) before refinement; restore_parts() rebuilds them."""
+        if self.parts:
+            torch = _torch()
+            self.parts = None
+            for d in MULTI_GPU:
+                with torch.cuda.device(torch.device(d)):
+                    torch.cuda.empty_cache()
+
+    def restore_parts(self):
+        if self._csr is not None and self.parts is None:
+            self._build_parts()
 
     def chunks(self, size=None):
         """(rows, cols, vals) on the device, NNZ_CHUNK nonzeros at a time (copied from pinned memory if host)."""
@@ -910,13 +1040,66 @@ class _CSRPad:
         return torch.where(m, out, torch.zeros((), dtype=out.dtype))
 
 
-def _padded_sparse(Csr, dev):
+DEVICE_PAD = None              # refinement partner lists on the GPU(s) (padded per batch there; no CPU padding): None = with
+                               # LENGTH_REF_UM set, if each device's share + DEVICE_PAD_HEADROOM_GB fits in its free memory
+DEVICE_PAD_HEADROOM_GB = 3.0
+PAD_LOG = []                   # refinement pad placement per side and stage ("device xK" / "cpu"; diagnostic)
+
+
+class _DevPad:
+    """CSR partner lists split by rows (equal nonzeros) across devices, compact (int64 row pointer, int32 columns, int16 or
+    float32 values); each device pads its own rows per batch (_side_ll)."""
+
+    def __init__(self, Csr, devs):
+        torch = _torch()
+        K = len(devs)
+        cuts = [0] + [int(np.searchsorted(Csr.indptr, Csr.nnz * k / K)) for k in range(1, K)] + [Csr.shape[0]]
+        vdt = torch.int16 if (Csr.nnz == 0 or Csr.data.max() <= 32767) else torch.float32
+        self.parts = []
+        for k, d in enumerate(devs):
+            r0, r1 = cuts[k], cuts[k + 1]; a, b = Csr.indptr[r0], Csr.indptr[r1]
+            self.parts.append((r0, r1, torch.device(d),
+                               torch.tensor(Csr.indptr[r0:r1 + 1] - a, dtype=torch.long, device=d),
+                               torch.tensor(Csr.indices[a:b], dtype=torch.int32, device=d),
+                               torch.tensor(Csr.data[a:b], dtype=vdt, device=d)))
+
+    @staticmethod
+    def fits(Csr, devs):
+        torch = _torch()
+        need = (Csr.nnz * 6 + (Csr.shape[0] + 1) * 8) / len(devs) + DEVICE_PAD_HEADROOM_GB * 1e9
+
+        def free(d):                                   # free device memory + memory cached (reserved, unused) by PyTorch
+            d = torch.device(d)
+            return torch.cuda.mem_get_info(d)[0] + torch.cuda.memory_reserved(d) - torch.cuda.memory_allocated(d)
+        return all(free(d) >= need for d in devs)
+
+
+def _pad_rows(part, rows_g, k):
+    """(len(rows_g), k) padded partner indices (int64) and counts (float32) of global rows rows_g, on part's device."""
+    torch = _torch()
+    r0, _, d, ip, ix, vl = part
+    loc = rows_g - r0
+    start = ip[loc]; ln = ip[loc + 1] - start
+    ar = torch.arange(k, device=d)
+    pos = (start[:, None] + ar[None, :]).clamp(max=max(len(ix) - 1, 0))
+    m = ar[None, :] < ln[:, None]
+    return torch.where(m, ix[pos], 0).long(), torch.where(m, vl[pos].float(), 0.0)
+
+
+def _padded_sparse(Csr, dev, device_ok=True):
     """Per-row partner lists padded to the longest row; kept in CPU memory (the longest row can be
     ~10x the median), batches are moved to the device in _side_ll. With LENGTH_REF_UM set (large arrays) the
     table is not materialized: rows are padded per batch from the CSR arrays (_CSRPad)."""
     torch = _torch()
     nnz = np.diff(Csr.indptr)
     if LENGTH_REF_UM is not None:
+        dv = torch.device(dev) if not isinstance(dev, torch.device) else dev
+        devs = list(MULTI_GPU) if MULTI_GPU else [dv]
+        use = device_ok and (DEVICE_PAD if DEVICE_PAD is not None else True) and dv.type == "cuda" and not REPEL_SPACING
+        if use and (DEVICE_PAD or _DevPad.fits(Csr, devs)):
+            PAD_LOG.append("device x%d" % len(devs))
+            return _DevPad(Csr, devs), None, torch.tensor(nnz), np.argsort(nnz)
+        PAD_LOG.append("cpu")
         ip = torch.tensor(Csr.indptr, dtype=torch.long)
         return (_CSRPad(ip, torch.tensor(Csr.indices, dtype=torch.long)), _CSRPad(ip, torch.tensor(Csr.data, dtype=torch.float32)),
                 torch.tensor(nnz), np.argsort(nnz))
@@ -974,6 +1157,8 @@ def _side_ll(Pos, pad, N, Other, w_other, G, tab, c, self_w=None, mG=None, repel
     ct = torch.as_tensor(float(c), dtype=torch.float32, device=dev)
     out = torch.empty(len(Pos), nc, device=dev)
     budget = BUDGET if LENGTH_REF_UM is None else BUDGET_LARGE
+    if isinstance(idx, _DevPad):
+        return _side_ll_devpad(out, idx, nnz, order, budget, Pos, N, Other, G, tab, c, self_w, mG, center, Ctr, Zg, lo)
     nz_sorted = np.maximum(np.asarray(nnz)[order], 1)       # order sorts rows by length: a batch's widest row is its last
     i = 0
     while i < len(order):
@@ -1008,6 +1193,67 @@ def _side_ll(Pos, pad, N, Other, w_other, G, tab, c, self_w=None, mG=None, repel
             ll = ll - REPEL_WEIGHT * (((REPEL_SPACING - dd).clamp(min=0) ** 2) * rm[rows, None, :]).sum(-1) / REPEL_SPACING ** 2
         out[rows] = ll
         i = j
+    return out
+
+
+def _batch_end(nz_sorted, i, nc, budget):
+    """Largest j > i with (j - i) * nc * nz_sorted[j - 1] <= budget (nz_sorted ascending), at least i + 1."""
+    lo_, hi_ = i + 1, len(nz_sorted)
+    if (hi_ - i) * nc * int(nz_sorted[hi_ - 1]) <= budget:
+        return hi_
+    while lo_ < hi_:
+        mid = (lo_ + hi_ + 1) // 2
+        if (mid - i) * nc * int(nz_sorted[mid - 1]) <= budget:
+            lo_ = mid
+        else:
+            hi_ = mid - 1
+    return max(lo_, i + 1)
+
+
+def _side_ll_devpad(out, dp, nnz, order, budget, Pos, N, Other, G, tab, c, self_w, mG, center, Ctr, Zg, lo):
+    """_side_ll with device-resident partner lists (_DevPad): each device scores the batches of its own rows (one thread
+    per device), padding them on the device; same per-row arithmetic as the CPU-padded path."""
+    torch = _torch()
+    dev = out.device; nc = len(G)
+    nnz_np = np.asarray(nnz)
+
+    def to(t, d):
+        return t.to(d) if torch.is_tensor(t) else t
+
+    def work(k):
+        part = dp.parts[k]; r0, r1, d = part[0], part[1], part[2]
+        ok = order[(order >= r0) & (order < r1)]                       # this device's rows, still sorted by length
+        nz_sorted = np.maximum(nnz_np[ok], 1)
+        with torch.no_grad(), torch.cuda.device(d):
+            Pk, Ck, Ok, Gk, tk, Nk = to(Pos, d), to(Ctr, d), to(Other, d), to(G, d), to(tab, d), to(N, d)
+            Zk, lok = to(Zg, d), (tuple(to(x, d) for x in lo) if isinstance(lo, (tuple, list)) else to(lo, d))
+            sw, mg = to(self_w, d), to(mG, d)
+            ct = torch.as_tensor(float(c), dtype=torch.float32, device=d)
+            ok_d = torch.tensor(ok, device=d)
+            res = torch.empty(len(ok), nc, device=d)
+            i = 0
+            while i < len(ok):
+                j = _batch_end(nz_sorted, i, nc, budget)
+                rows = ok_d[i:j]
+                kmax = max(int(nz_sorted[j - 1]), 1)
+                cand = Ck[rows][:, None, :] + Gk[None]
+                nb, vv = _pad_rows(part, rows, kmax)
+                obs = _cand_obs(cand, Ok[nb], vv, tk, ct)
+                Z = _interp(Zk, lok, cand.reshape(-1, 2)).reshape(len(rows), nc)
+                if sw is not None:
+                    if center is None:
+                        Z = (Z - sw[rows, None] * mg[None, :]).clamp(min=1e-30)
+                    else:
+                        dself = (cand - Pk[rows][:, None, :]).norm(dim=-1)
+                        Z = (Z - sw[rows, None] * torch.exp(_logm(dself, tk, c))).clamp(min=1e-30)
+                res[i:j] = obs - Nk[rows, None] * torch.log(Z)
+                i = j
+            torch.cuda.synchronize(d)
+        return ok, res
+
+    for ok, res in _on_devices(work, len(dp.parts)):
+        if len(ok):
+            out[torch.tensor(ok, device=dev)] = res.to(dev)
     return out
 
 
@@ -1243,10 +1489,25 @@ def _near_cells_on():
     return NEAR_CELLS if NEAR_CELLS is not None else LENGTH_REF_UM is not None
 
 
+class _CellLists:
+    """Cell lists as groups of cells of similar size, each padded to its own widths: (R, Rm, S, Sm) per group (see
+    _cell_lists). Iterating gives the groups."""
+
+    def __init__(self, groups):
+        self.groups = groups
+
+    def __iter__(self):
+        return iter(self.groups)
+
+
+CELL_GROUP_RATIO = 2.0   # cells grouped so a group's widest candidate list is at most this times its narrowest (crowded cells,
+                         # e.g. from a folded or crushed layout, no longer set the padding of every cell)
+
+
 def _cell_lists(X, U, radius):
     """Receivers X grouped by grid cell (side radius / 2) and, per cell, the senders U in its 5 x 5 cell
-    neighbourhood (every sender within `radius` of any of the cell's receivers), both padded:
-    (R (n_cell, maxR), Rm mask, S (n_cell, maxS), Sm mask)."""
+    neighbourhood (every sender within `radius` of any of the cell's receivers), padded per group of similar-size
+    cells: _CellLists of (R (n_cell, maxR), Rm mask, S (n_cell, maxS), Sm mask)."""
     torch = _torch()
     with torch.no_grad():
         L = radius / 2.0
@@ -1261,17 +1522,27 @@ def _cell_lists(X, U, radius):
         ox = torch.argsort(cx); cxs = cx[ox]
         cells, rc = torch.unique_consecutive(cxs, return_counts=True)
         rs = torch.cumsum(rc, 0) - rc
-        maxR = -(-int(rc.max()) // 32) * 32; ar = torch.arange(maxR, device=X.device)         # widths bucketed (fewer compiled shapes)
-        R = ox[(rs[:, None] + ar[None, :]).clamp(max=len(ox) - 1)]; Rm = ar[None, :] < rc[:, None]
         off = torch.tensor([dx * ny + dy for dx in range(-2, 3) for dy in range(-2, 3)], device=X.device)
         nbc = (cells[:, None] + off[None, :]).clamp(0, ncell - 1)          # cells padded by 2 on every side: no wrap
-        cnt = ucount[nbc]; st = ustart[nbc]
-        cum = torch.cumsum(cnt, 1); tot = cum[:, -1]
-        maxS = -(-int(tot.max()) // 128) * 128; js = torch.arange(maxS, device=X.device)
-        seg = torch.searchsorted(cum, js[None, :].expand(len(cells), maxS).contiguous(), right=True).clamp(max=24)
-        within = js[None, :] - (cum - cnt).gather(1, seg)
-        S = ou[(st.gather(1, seg) + within).clamp(0, len(ou) - 1)]; Sm = js[None, :] < tot[:, None]
-    return R, Rm, S, Sm
+        cnt_all = ucount[nbc]; st_all = ustart[nbc]
+        tot_all = cnt_all.sum(1)
+        order = torch.argsort(tot_all); tsorted = tot_all[order].cpu().numpy()
+        groups, i = [], 0
+        while i < len(tsorted):                        # groups of cells with widths within CELL_GROUP_RATIO
+            j = int(np.searchsorted(tsorted, max(int(tsorted[i]), 1) * CELL_GROUP_RATIO, side="right"))
+            j = max(j, i + 1)
+            sel = order[i:j]
+            rcg, rsg, cnt, st = rc[sel], rs[sel], cnt_all[sel], st_all[sel]
+            maxR = -(-int(rcg.max()) // 32) * 32; ar = torch.arange(maxR, device=X.device)   # widths bucketed (fewer compiled shapes)
+            R = ox[(rsg[:, None] + ar[None, :]).clamp(max=len(ox) - 1)]; Rm = ar[None, :] < rcg[:, None]
+            cum = torch.cumsum(cnt, 1); tot = cum[:, -1]
+            maxS = max(-(-int(tot.max()) // 128) * 128, 128); js = torch.arange(maxS, device=X.device)
+            seg = torch.searchsorted(cum, js[None, :].expand(len(sel), maxS).contiguous(), right=True).clamp(max=24)
+            within = js[None, :] - (cum - cnt).gather(1, seg)
+            S = ou[(st.gather(1, seg) + within).clamp(0, len(ou) - 1)]; Sm = js[None, :] < tot[:, None]
+            groups.append((R, Rm, S, Sm))
+            i = j
+    return _CellLists(groups)
 
 
 def _cell_k_eager(Xr, Us, ok, tab, c):
@@ -1347,8 +1618,14 @@ _cell_rows_grad = _maybe_compiled(_cell_rows_grad_eager, dynamic=True)
 _cell_cols_grad = _maybe_compiled(_cell_cols_grad_eager, dynamic=True)
 
 
-def _cell_batches(R, Rm, S, Sm):
-    """Batches of cells, all padded to the same number of cells (masked dummies), so compiled kernels see few shapes."""
+def _cell_batches(cl):
+    """Batches of cells over the groups of _cell_lists; within a group all padded to the same number of cells (masked
+    dummies), so compiled kernels see few shapes."""
+    for R, Rm, S, Sm in cl:
+        yield from _cell_group_batches(R, Rm, S, Sm)
+
+
+def _cell_group_batches(R, Rm, S, Sm):
     torch = _torch()
     per = max(1, NEAR_CELL_BATCH // (R.shape[1] * S.shape[1]))
     for j in range(0, len(R), per):
@@ -1375,25 +1652,25 @@ def _near_cells_fn():
     class NearCells(torch.autograd.Function):
         @staticmethod
         def forward(ctx, X, U, w, tab, c, shared, transpose):
-            R, Rm, S, Sm = _cell_lists(X.detach(), U.detach(), float(FAST_R2))
+            cl = _cell_lists(X.detach(), U.detach(), float(FAST_R2))
             out = torch.zeros(len(U) if transpose else len(X), device=X.device, dtype=w.dtype)
             f = _cell_cols if transpose else _cell_rows
             with torch.no_grad():
-                for r, rm, s_, sm in _cell_batches(R, Rm, S, Sm):
+                for r, rm, s_, sm in _cell_batches(cl):
                     part = f(X, U, r, rm, s_, sm, w, tab, c, shared)
                     idx, m = (s_, sm) if transpose else (r, rm)
                     out.index_add_(0, idx[m], part[m])
-            ctx.save_for_backward(X, U, w, tab, R, Rm, S, Sm)
-            ctx.shared, ctx.transpose = shared, transpose
+            ctx.save_for_backward(X, U, w, tab)
+            ctx.cl, ctx.shared, ctx.transpose = cl, shared, transpose
             return out
 
         @staticmethod
         def backward(ctx, gout):
-            X, U, w, tab, R, Rm, S, Sm = ctx.saved_tensors
+            X, U, w, tab = ctx.saved_tensors
             gX, gU, gw = torch.zeros_like(X), torch.zeros_like(U), torch.zeros_like(w)
             f = _cell_cols_grad if ctx.transpose else _cell_rows_grad
             with torch.no_grad():
-                for r, rm, s_, sm in _cell_batches(R, Rm, S, Sm):
+                for r, rm, s_, sm in _cell_batches(ctx.cl):
                     dx, du, dw = f(X, U, r, rm, s_, sm, w, tab, ctx.shared, gout)
                     gX.index_add_(0, r[rm], dx[rm]); gU.index_add_(0, s_[sm], du[sm])
                     wi, wm = (r, rm) if ctx.transpose else (s_, sm)
@@ -1404,6 +1681,76 @@ def _near_cells_fn():
     return NearCells
 
 
+def _cell_rows_vg_eager(X, U, R, Rm, S, Sm, w, tab, shared, g):
+    """sum_b g_b sum_o w_o k(d_bo) over one batch of cells, and its gradient w.r.t. X (per receiver entry) and U (per candidate
+    entry), in one pass (as _cell_rows_eager forward + _cell_rows_grad_eager backward)."""
+    k, dk, D, d = _cell_kd_eager(X[R], U[S], _cell_ok(R, Rm, S, Sm, shared), tab)
+    gw = g[R][:, :, None] * w[S][:, None, :]
+    coef = (gw * dk / d)[..., None] * D
+    return (gw * k).sum(), coef.sum(2), -coef.sum(1)
+
+
+_cell_rows_vg = _maybe_compiled(_cell_rows_vg_eager, dynamic=True)
+_NEAR_EXP_FN = None
+
+
+def _near_exp_fn():
+    """torch.autograd.Function for the warp's near expected term sum_b g_b s_b (s_b = sum_o w_o k(d_bo); g, w held fixed):
+    value and gradient w.r.t. X, U in one batched pass during the forward; backward scales the stored gradient (no
+    separate forward; g and w get no gradient)."""
+    global _NEAR_EXP_FN
+    if _NEAR_EXP_FN is not None:
+        return _NEAR_EXP_FN
+    torch = _torch()
+
+    class NearExp(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, X, U, w, g, tab, shared):
+            gX, gU = torch.zeros_like(X), torch.zeros_like(U)
+            val = torch.zeros((), dtype=X.dtype, device=X.device)
+            devs = [torch.device(d) for d in MULTI_GPU] if (MULTI_GPU and X.is_cuda) else [X.device]
+            K = len(devs); same = U is X
+
+            def work(k):                                  # several devices: each every K-th cell batch, one thread each
+                d = devs[k]
+                with torch.no_grad(), torch.cuda.device(d) if d.type == "cuda" else contextlib.nullcontext():
+                    Xk = X.detach().to(d); Uk = Xk if same else U.detach().to(d)
+                    wk, gk, tk = w.to(d), g.to(d), tab.to(d)
+                    cl = _cell_lists(Xk, Uk, float(FAST_R2))
+                    vk = torch.zeros((), dtype=X.dtype, device=d); gXk, gUk = torch.zeros_like(Xk), torch.zeros_like(Uk)
+                    for b, (r, rm, s_, sm) in enumerate(_cell_batches(cl)):
+                        if b % K != k:
+                            continue
+                        v, dx, du = _cell_rows_vg(Xk, Uk, r, rm, s_, sm, wk, tk, shared, gk)
+                        vk = vk + v; gXk.index_add_(0, r[rm], dx[rm]); gUk.index_add_(0, s_[sm], du[sm])
+                return vk, gXk, gUk
+            with torch.no_grad():
+                for vk, gXk, gUk in _on_devices(work, K):
+                    val = val + vk.to(X.device); gX += gXk.to(X.device); gU += gUk.to(X.device)
+            ctx.save_for_backward(gX, gU)
+            return val
+
+        @staticmethod
+        def backward(ctx, gout):
+            gX, gU = ctx.saved_tensors
+            return gout * gX, gout * gU, None, None, None, None
+
+    _NEAR_EXP_FN = NearExp
+    return NearExp
+
+
+def _exp_term(fk, X, U, q, a, tab):
+    """sum_b exp(q_b) row_sums_b: fused near part (_near_exp_fn) + far field + background, in large-array mode with cell
+    near sums; else the plain row sums."""
+    torch = _torch()
+    g, w = torch.exp(q), torch.exp(a)
+    if fk.nb is None and WIDTH is None and LENGTH_REF_UM is not None:
+        far = fk.mesh.sample(fk.mesh.convolve(fk.mesh.spread(U, w)), X)
+        bg = fk.c * (w.sum() - (w if fk.shared else 0.0))
+        return _near_exp_fn().apply(X, U, w.detach(), g.detach(), tab, fk.shared) + (g * (far + bg)).sum()
+    return (g * fk.row_sums(X, U, w)).sum()
+
+
 def _near_sum_cells(X, U, w, tab, c, shared, transpose=False):
     """Near-field sums without a stored pair list (exactly the stored-pair sums at radius FAST_R2):
     transpose=False: s_b = sum_o w_o K(d_bo)(1 - S(d_bo)) over receivers X; True: t_o = sum_b w_b K (1 - S) over U.
@@ -1411,10 +1758,10 @@ def _near_sum_cells(X, U, w, tab, c, shared, transpose=False):
     torch = _torch()
     if torch.is_grad_enabled() and (X.requires_grad or U.requires_grad or w.requires_grad):
         return _near_cells_fn().apply(X, U, w, tab, c, shared, transpose)
-    R, Rm, S, Sm = _cell_lists(X.detach(), U.detach(), float(FAST_R2))
+    cl = _cell_lists(X.detach(), U.detach(), float(FAST_R2))
     out = torch.zeros(len(U) if transpose else len(X), device=X.device, dtype=w.dtype)
     f = _cell_cols if transpose else _cell_rows
-    for r, rm, s_, sm in _cell_batches(R, Rm, S, Sm):
+    for r, rm, s_, sm in _cell_batches(cl):
         part = f(X, U, r, rm, s_, sm, w, tab, c, shared)
         idx, m = (s_, sm) if transpose else (r, rm)
         out = out.index_add(0, idx[m], part[m])
@@ -1425,11 +1772,8 @@ def _near_pairs_cells(X, U, shared, radius):
     """As _near_pairs, from the cell lists of _cell_lists (int32 indices, sorted by receiver)."""
     torch = _torch()
     with torch.no_grad():
-        R, Rm, S, Sm = _cell_lists(X, U, float(radius))
-        per = max(1, NEAR_CELL_BATCH // (R.shape[1] * S.shape[1]))
         rr, oo = [], []
-        for j in range(0, len(R), per):
-            r, rm, o, om = R[j:j + per], Rm[j:j + per], S[j:j + per], Sm[j:j + per]
+        for r, rm, o, om in _cell_batches(_cell_lists(X, U, float(radius))):
             d = torch.cdist(X[r], U[o])
             ok = rm[:, :, None] & om[:, None, :] & (d < radius)
             if shared:
@@ -1539,9 +1883,29 @@ def _obs_fn():
             gX, gU = torch.zeros_like(X), torch.zeros_like(U)
             val = torch.zeros((), dtype=X.dtype, device=X.device)
             with torch.no_grad():
-                for r, o, v in cnt.chunks(OBS_CHUNK):
-                    vv, g = _obs_vg(X, U, r, o, v, tab, c)
-                    val = val + vv; gX.index_add_(0, r, g); gU.index_add_(0, o, -g)
+                if getattr(cnt, "parts", None):          # several devices: each its share of the counts, one thread each
+                    same = U is X
+
+                    devs = list(dict.fromkeys(p.dev for p in cnt.parts))
+
+                    def work(k):
+                        d = devs[k]
+                        with torch.no_grad(), torch.cuda.device(d):
+                            Xk = X.to(d); Uk = Xk if same else U.to(d)
+                            tk = tab.to(d); ck = torch.as_tensor(c, device=d)
+                            vk = torch.zeros((), dtype=X.dtype, device=d); gXk, gUk = torch.zeros_like(Xk), torch.zeros_like(Uk)
+                            for part in (p for p in cnt.parts if p.dev == d):
+                                for r, o, v in part.chunks(OBS_CHUNK):
+                                    vv, g = _obs_vg(Xk, Uk, r, o, v, tk, ck)
+                                    vk = vk + vv; gXk.index_add_(0, r, g); gUk.index_add_(0, o, -g)
+                            torch.cuda.synchronize(d)
+                        return vk, gXk, gUk
+                    for vk, gXk, gUk in _on_devices(work, len(devs)):
+                        val = val + vk.to(X.device); gX += gXk.to(X.device); gU += gUk.to(X.device)
+                else:
+                    for r, o, v in cnt.chunks(OBS_CHUNK):
+                        vv, g = _obs_vg(X, U, r, o, v, tab, c)
+                        val = val + vv; gX.index_add_(0, r, g); gU.index_add_(0, o, -g)
             ctx.save_for_backward(gX, gU)
             return val
 
@@ -1628,7 +1992,7 @@ def _ll_and_grad_fast(X0, U0, warp, cnt, q, a, fk, tab, c):
         # freed at once), then one backward pass through the warp
         assert not JOINT_WIDTH, "JOINT_WIDTH needs device-resident counts"
         Xd = X.detach().requires_grad_(True); Ud = Xd if cnt.shared else U.detach().requires_grad_(True)
-        ((torch.exp(q) * fk.row_sums(Xd, Ud, torch.exp(a))).sum() / 1e6).backward()
+        (_exp_term(fk, Xd, Ud, q, a, fk.tab) / 1e6).backward()
         if _obs_fast():                         # large arrays: value + analytic gradient in large batches
             (-_obs_fn().apply(Xd, Ud, tab, fk.ct, cnt) / 1e6).backward()
         else:
@@ -1639,7 +2003,7 @@ def _ll_and_grad_fast(X0, U0, warp, cnt, q, a, fk, tab, c):
         else:
             torch.autograd.backward([X, U], [Xd.grad, Ud.grad])
         return
-    loss = (torch.exp(q) * fk.row_sums(X, U, torch.exp(a))).sum()
+    loss = _exp_term(fk, X, U, q, a, fk.tab)
     if _obs_fast():
         loss = loss - _obs_fn().apply(X, U, tab, fk.ct, cnt)
     else:
@@ -2242,8 +2606,8 @@ def refine_fast(X, U, Csr, cnt, tab, c, q, a):
     over +-W/(COARSE_N-1) around the coarse optimum), with mesh normalizers."""
     torch = _torch()
     dev = X.device
-    padR = _padded_sparse(Csr, dev)
-    padS = _padded_sparse(Csr.T.tocsr(), dev)
+    padR = _padded_sparse(Csr, dev, device_ok=False)          # (_side_ll_fast pads on the CPU)
+    padS = _padded_sparse(Csr.T.tocsr(), dev, device_ok=False)
 
     def grid(W, n=None):
         h = torch.linspace(-W, W, n or COARSE_N, device=dev)
@@ -2518,7 +2882,8 @@ def _reconstruct_general(Csr, receivers_init, array_diameter, phi, lam, device, 
         kind = f"{Cf.shape[0]} shared beads" if shared else f"{Cf.shape[0]} receivers x {Cf.shape[1]} senders"
         print(f"accumap count model ({'fast' if fast else 'exact general'} path): {kind}, {Cf.sum():.3g} counts, {Cf.nnz} nonzero, "
               f"kernel matrix {cnt.kernel_store}, footprint {footprint if isinstance(footprint, str) else 'polygon'}, "
-              f"device {dev}", flush=True)
+              f"device {dev}" + (f" + {len(MULTI_GPU) - 1} more ({100 * cnt.streamed_frac:.0f}% of counts streamed from host)"
+                                 if cnt.parts else ""), flush=True)
     global REFINE_ROUNDS
     REFINE_ROUNDS = refine_rounds   # set before the first refinement
     REFINE_LOG.clear()
@@ -2541,7 +2906,9 @@ def _reconstruct_general(Csr, receivers_init, array_diameter, phi, lam, device, 
         print(f"  kernel fit on initial layout, background {c:.2e} ({time.time() - t0:.0f}s)", flush=True)
     stage, ref = (warp_stage_fast, refine_fast if FAST_REFINE else refine_general) if fast else (warp_stage_general, refine_general)
     Xw, Uw, q, a = stage(X0, U0, cnt, tab, c, phi=phi, lam=lam, footprint=footprint, verbose=verbose, t0=t0)
+    cnt.release_parts()                        # warp-only count shares off the devices during refinement
     X, U = ref(Xw, Uw, Cf, cnt, tab, c, q, a)
+    cnt.restore_parts()
     global ISO_CENTER
     ISO_CENTER = bool(iso_center)
     plog, prevX = ([] if ((log_passes or verbose) and fast) else None), None
@@ -2576,7 +2943,9 @@ def _reconstruct_general(Csr, receivers_init, array_diameter, phi, lam, device, 
             print(f"  isotropy stage: {len(ri)} contacts, weight {isotropy}, penalty before {p0:.2e}", flush=True)
         Xw, Uw, q, a = warp_stage_fast(X, U, cnt, tab, c, phi=phi, lam=lam, footprint=footprint, verbose=verbose,
                                        t0=t0, schedule=ISO_SCHEDULE, iso=iso)
+        cnt.release_parts()                    # warp-only count shares off the devices during refinement
         X, U = ref(Xw, Uw, Cf, cnt, tab, c, q, a)
+        cnt.restore_parts()
         if plog is not None:
             _log_pass()
     tdiag = None
