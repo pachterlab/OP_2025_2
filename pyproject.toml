@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,16 @@ version = "0.1.0"
 description = "Imaging-free reconstruction of bead positions in diffusion-based, optics-free spatial transcriptomics"
 readme = "README.md"
 requires-python = ">=3.9"
+license = "BSD-2-Clause"
+license-files = ["LICENSE"]
+authors = [{name = "Conrad Oakes"}, {name = "Lior Pachter"}]
+keywords = ["spatial transcriptomics", "array reconstruction", "optics-free", "imaging-free", "Poisson model"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
 dependencies = [
     "numpy>=1.26",
     "pandas",
@@ -19,8 +29,9 @@ dependencies = [
     "matplotlib",
 ]
 
-[project.optional-dependencies]
-fast = ["numba"]   # compiled loops in accumap.multilevel (pure Python otherwise)
+[project.urls]
+Repository = "https://github.com/pachterlab/OP_2025_2"
+Issues = "https://github.com/pachterlab/OP_2025_2/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

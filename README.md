@@ -17,14 +17,27 @@ accumap models each receiver-by-sender count as Poisson, with the expected count
 
 ## Installation
 
+accumap needs Python 3.9 or later. It runs on CPU, but a CUDA GPU is strongly recommended.
+
+**1. PyTorch (for GPU use).** `pip` installs the newest PyTorch build, which may require a newer NVIDIA driver than your
+machine has; PyTorch then silently runs on the CPU. To use a GPU, first install the PyTorch build that matches your CUDA
+driver, using the selector at https://pytorch.org/get-started/locally/ (check your driver's CUDA version with `nvidia-smi`).
+Check with `python -c "import torch; print(torch.cuda.is_available())"`.
+
+**2. accumap only:**
+
+```
+pip install git+https://github.com/pachterlab/OP_2025_2.git
+```
+
+**To reproduce the paper** (package, notebooks and their cached results):
+
 ```
 git clone https://github.com/pachterlab/OP_2025_2.git
 cd OP_2025_2
-pip install -e .                    # accumap (installs PyTorch)
+pip install -e .                    # accumap (installs PyTorch if not already installed)
 pip install -r requirements.txt     # notebook dependencies
 ```
-
-accumap runs on CPU, but a CUDA GPU is strongly recommended.
 
 ## Usage
 
