@@ -52,6 +52,8 @@ receivers, senders = result["receivers"], result["senders"]
 
 For arrays in which every bead both sends and receives, pass the square bead-by-bead matrix with `shared=True` (and `umap_layout(C, shared=True)`). `n_starts=3` runs several UMAP initializations and keeps the most likely layout. accumap warns if the counts indicate that transfer favors one direction; for such arrays use `iso_center=True` (see `SCOPE_Simulator.ipynb`). The `reconstruct` docstring documents every option.
 
+**Large arrays and array shape.** For large arrays, `multilevel_layout(C, footprint=...)` builds the starting layout (see `Large_Arrays_Demo.ipynb`). It has been tested in simulation on rectangles up to 4:1 and on an L-shape, and recovers them well. More elongated arrays (5:1 and beyond) or shapes with long parallel arms, such as a U, often come out folded. For those, provide your own starting layout with the right overall arrangement, e.g. from fiducials or imaging.
+
 ## Reproducing the paper
 
 Each notebook draws its figures and tables from the cached results in `analysis_scripts/paper_results/` and runs a small live example. Setting `RECOMPUTE = True` in a notebook reruns its analyses from scratch (CUDA GPU required) and writes to a separate folder, so the cache is never overwritten. Each notebook states its runtime and the data it needs.

@@ -29,6 +29,9 @@ dependencies = [
     "matplotlib",
 ]
 
+[project.optional-dependencies]
+fast = ["numba"]   # compiled loops in accumap.multilevel (pure Python otherwise)
+
 [project.urls]
 Repository = "https://github.com/pachterlab/OP_2025_2"
 Issues = "https://github.com/pachterlab/OP_2025_2/issues"

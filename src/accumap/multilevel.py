@@ -65,16 +65,72 @@ def footprint_aspect(sq):
     return _aspect(g[Path(sq).contains_points(g)])
 
 
-def coarse_candidates(Cs, seed, target_aspect=None):
-    """Coarsest-level UMAP starts: [(name, layout)], the default (spectral init), plus COARSE_RANDOM_TRIES random-init
-    UMAPs (cm.umap_layout settings, UMAP's default epochs) for elongated footprints."""
+def _graph_fiedler(Cc, k):
+    """First nontrivial eigenvector (normalized Laplacian, log1p weights) of the graph of each node's k strongest partners."""
+    from scipy.sparse.linalg import eigsh
+    S = sparsify(Cc, k); W = (S + S.T).tocsr().astype(float); W.setdiag(0); W.eliminate_zeros(); W.data = np.log1p(W.data)
+    d = np.asarray(W.sum(1)).ravel(); Dm = sp.diags(1 / np.sqrt(np.maximum(d, 1e-12)))
+    w, U = eigsh(sp.eye(W.shape[0]) - Dm @ W @ Dm, k=3, sigma=-1e-3, which="LM")
+    return (Dm @ U[:, np.argsort(w)])[:, 1]
+
+
+def _footprint_fiedler(fp, n_pts=6000, seed=1):
+    """Points sampled inside a footprint polygon and the first nontrivial eigenvector of their 8-NN graph."""
+    from matplotlib.path import Path
+    from scipy.spatial import cKDTree
+    from scipy.sparse.linalg import eigsh
+    fp = np.asarray(fp, float); lo, hi = fp.min(0), fp.max(0); rng = np.random.default_rng(seed); pts, n = [], 0
+    while n < n_pts:
+        q = rng.uniform(lo, hi, (n_pts, 2)); q = q[Path(fp).contains_points(q)]; pts.append(q); n += len(q)
+    G = np.concatenate(pts)[:n_pts]
+    _, ii = cKDTree(G).query(G, 9); r = np.repeat(np.arange(len(G)), 8)
+    A = sp.csr_matrix((np.ones(len(r)), (r, ii[:, 1:].ravel())), shape=(len(G), len(G))); A = ((A + A.T) > 0).astype(float)
+    Dm = sp.diags(1 / np.sqrt(np.asarray(A.sum(1)).ravel()))
+    w, U = eigsh(sp.eye(len(G)) - Dm @ A @ Dm, k=3, sigma=-1e-3, which="LM")
+    return G, (Dm @ U[:, np.argsort(w)])[:, 1]
+
+
+COARSE_FIEDLER = True   # polygon footprints: coarsest candidates started from the coarse graph's Fiedler vector (which orders the
+                        # nodes along an elongated array even when the graph is noisy): "fiedler" = Fiedler rank as the long-axis
+                        # coordinate; "fp-match" = nodes placed, in Fiedler order, onto footprint points in the order of the
+                        # footprint's own Fiedler vector (follows bends, e.g. an L). Shape tests (coarsest level, after accumap):
+                        # 2.4:1 spectral 1,659 / fiedler 48 / fp-match 168 um; 4:1 1,566 / 28 / 26 um.
+
+
+def coarse_candidates(Cs, seed, target_aspect=None, Cc=None, footprint=None):
+    """Coarsest-level UMAP starts: [(name, layout)], the default (spectral init); for polygon footprints (COARSE_FIEDLER) UMAPs
+    initialized from the Fiedler vector of Cc (Fiedler rank; footprint matched); for elongated footprints also
+    COARSE_RANDOM_TRIES random-init UMAPs (cm.umap_layout settings, UMAP's default epochs)."""
     out = [(f"spectral s{seed}", cm.umap_layout(Cs, seed=seed, shared=True))]
-    if target_aspect is not None and target_aspect >= COARSE_ASPECT_MIN and COARSE_RANDOM_TRIES:
-        import umap
-        S = (Cs + Cs.T).tocsr().astype(np.float32); S.data = np.log1p(S.data)
+    poly = footprint is not None and not isinstance(footprint, str)
+    elongated = target_aspect is not None and target_aspect >= COARSE_ASPECT_MIN
+    if not ((poly and COARSE_FIEDLER and Cc is not None) or (elongated and COARSE_RANDOM_TRIES)):
+        return out
+    import umap
+    S = (Cs + Cs.T).tocsr().astype(np.float32); S.data = np.log1p(S.data)
+
+    def run(init, s):
+        return umap.UMAP(random_state=s, metric="cosine", n_neighbors=25, min_dist=0.99, n_components=2,
+                         init=init).fit_transform(S).astype(np.float32)
+    if poly and COARSE_FIEDLER and Cc is not None:
+        m = Cs.shape[0]; rng = np.random.default_rng(seed)
+        G, gf = _footprint_fiedler(footprint, seed=seed + 1); order_g = np.argsort(gf)
+        for k in (10, 30):
+            try:
+                f = _graph_fiedler(Cc, k)
+            except Exception:                          # (eigensolver failure on a degenerate graph: skip)
+                continue
+            order_n = np.argsort(f)
+            if k == 10:                                # Fiedler rank as the long-axis coordinate
+                y = (np.argsort(order_n) / m - 0.5) * 10.0
+                asp = target_aspect if target_aspect else 1.0
+                out.append((f"fiedler k{k}", run(np.c_[rng.normal(0, 10.0 / asp / 4, m), y], seed)))
+            pos = np.empty((m, 2)); idx = np.linspace(0, len(G) - 1, m).round().astype(int)
+            pos[order_n] = G[order_g[idx]] + rng.normal(0, 1e-3 * np.ptp(G, 0).max(), (m, 2))
+            out.append((f"fp-match k{k}", run((pos - pos.mean(0)) / pos.std() * 3.0, seed)))
+    if elongated and COARSE_RANDOM_TRIES:
         for t in range(COARSE_RANDOM_TRIES):
-            out.append((f"random s{seed + 1 + t}", umap.UMAP(random_state=seed + 1 + t, metric="cosine", n_neighbors=25, min_dist=0.99,
-                                                             n_components=2, init="random").fit_transform(S).astype(np.float32)))
+            out.append((f"random s{seed + 1 + t}", run("random", seed + 1 + t)))
     return out
 
 
@@ -85,6 +141,7 @@ RELOCATE_MARGIN = 0.01     # nodes outside it are misplaced (eye chart, after ac
                            # 0.47 / 0.07 / 0.01%, robust median 50.0 / 50.8 / 50.9 um: edge beads pulled to their partners)
 RELOCATE_DIST = 4.0        # ... as are nodes farther than this many median partner distances from their partners' median
 RELOCATE_FLOOR = 0.02      # (and at least this fraction of the footprint's short side, if a polygon footprint is given)
+RELOCATE_MAX_OUTSIDE = 0.15   # outside test used only if the posed footprint leaves at most this fraction of nodes outside
 RELOCATE_AFTER = True          # for callers (e.g. run scripts): also relocate accumap's result (polygon footprints)
 RELOCATE_PASSES = (4.0, 3.0)   # multilevel start, polygon footprints: relocation passes on the beads at the end (RELOCATE_DIST per
                                # pass; footprint test in the first). Eye chart run-6 result: beads > 1 mm 2.53% -> 0.84% -> 0.52%
@@ -111,14 +168,19 @@ def relocate(C, Y, footprint=None, verbose=True, outside=True):
     poly = footprint is not None and not isinstance(footprint, str)
     if poly:
         from matplotlib.path import Path
-        posed = cm._pose_polygon(Y, np.asarray(footprint, float) - np.asarray(footprint, float).mean(0), frac=RELOCATE_POSE_FRAC)
-        ctr = posed.mean(0); V = posed - ctr
+        fpa = np.asarray(footprint, float)
+        posed = cm._pose_polygon(Y, fpa - cm.polygon_centroid(fpa), frac=RELOCATE_POSE_FRAC)
+        ctr = cm.polygon_centroid(posed); V = posed - ctr
         short = float(np.sqrt(np.linalg.eigvalsh(np.cov(V.T))[0]) * 2 * np.sqrt(3))
         thr = max(thr, RELOCATE_FLOOR * short)          # prolonged starts: beads of a node coincide, so the median is ~0
     bad = np.isfinite(d) & (d > thr)
     if poly and outside:
         grown = ctr + V * (1 + 2 * RELOCATE_MARGIN * short / np.maximum(np.linalg.norm(V, axis=1, keepdims=True), 1e-9))
-        bad |= ~Path(grown).contains_points(Y)
+        out_ = ~Path(grown).contains_points(Y)
+        if out_.mean() <= RELOCATE_MAX_OUTSIDE:         # a pose that leaves many nodes outside has failed (layout not
+            bad |= out_                                 # shaped like the footprint): skip the outside test
+        elif verbose:
+            print(f"  relocate: footprint pose left {100 * out_.mean():.0f}% of nodes outside; outside test skipped", flush=True)
     n_bad = int(bad.sum())
     good = ~bad
     for _ in range(1000):
@@ -137,6 +199,36 @@ def relocate(C, Y, footprint=None, verbose=True, outside=True):
     if verbose:
         print(f"  relocate: {n_bad:,} misplaced nodes ({100 * n_bad / n:.2f}%), {int(good.sum() - (n - n_bad)):,} relocated", flush=True)
     return Y, n_bad
+
+
+COARSE_DEVICES = None   # e.g. ["cuda:0", "cuda:1"]: the coarsest candidates (accumap each) run in worker processes, one per device
+                        # (processes, not threads: reconstruct sets module-level state). None: one after another on `device`.
+                        # Workers are spawned and re-import the calling script: guard its code with if __name__ == "__main__":
+
+_W_SETTINGS = {}
+
+
+def _settings_snapshot():
+    """count_model's simple module settings (upper-case names) in effect, for worker processes."""
+    out = {}
+    for k, v in vars(cm).items():
+        if k.isupper() and (v is None or isinstance(v, (bool, int, float, str, tuple))):
+            out[k] = v
+    out["MULTI_GPU"] = None
+    return out
+
+
+def _worker_init(settings):
+    for k, v in settings.items():
+        setattr(cm, k, v)
+
+
+def _coarse_job(Cs, Ec, diam, sq, device, select):
+    """One coarsest candidate in a worker: accumap from Ec, scored as in multilevel_layout. -> (score, layout)"""
+    Yk = np.asarray(cm.reconstruct(Cs, Ec, diam, shared=True, footprint=sq, verbose=False, device=device,
+                                   n_starts=COARSE_STARTS)["receivers"], float)
+    sc = density_excess(Yk) if select == "density" else -cm.log_likelihood(Cs, Yk, diam, shared=True, device=device)
+    return sc, Yk
 
 
 COARSE_STARTS = 1  # UMAP starts at the coarsest level (accumap n_starts: the highest-likelihood layout is kept)
@@ -234,7 +326,7 @@ def _footprint(side=None, diam=None, footprint=None):
     if footprint is None or (isinstance(footprint, str) and footprint == "disc"):
         assert diam is not None, "a disc footprint needs diam"
         return float(diam), "disc"
-    fp = np.asarray(footprint, float); fp = fp - fp.mean(0)
+    fp = np.asarray(footprint, float); fp = fp - cm.polygon_centroid(fp)
     d = float(np.max(np.linalg.norm(fp[:, None] - fp[None], axis=-1))) if diam is None else float(diam)
     return d, fp
 
@@ -249,7 +341,11 @@ def heavy_edge_round(S, rng):
 
 
 FULL_BELOW = 70000   # with PRUNE_K0: levels with at most this many nodes (the ones multilevel_layout reconstructs) carry full
-                     # aggregated counts; larger levels carry the pruned matching graph only
+                     # aggregated counts; larger levels carry the pruned matching graph only (raised to `finest` when larger)
+LIGHT_ABOVE = 70000          # multilevel_layout levels with more nodes than this (reached with a larger `finest`) use a light
+LIGHT_FIT_ITERS = 100        # schedule: finest warp grid only (LIGHT_WARP_SCHEDULE, None = last entry of WARP_SCHEDULE), one pass
+LIGHT_REFINE_ROUNDS = 2      # (no isotropy stage), a short kernel fit and capped refinement -- they only need to sort out local
+LIGHT_WARP_SCHEDULE = None   # arrangement under a global shape the coarser levels already set
 PRUNE_K0 = 30   # coarsen() first keeps each node's PRUNE_K0 strongest partners (count matrix symmetrized); the scipy operations
                 # on the full matrix (443M nonzeros at 18 mm) dominated coarsening time. None: no pruning
 MATCH_WEIGHT = "sqrt"   # edge weight for MATCH_K: "sqrt" (count / sqrt(size_i size_j)) or "excess" (count minus the
@@ -350,27 +446,47 @@ def multilevel_layout(C, side=None, target=5000, finest=70000, seed=0, device="c
     -> (n, 2) start in caller units, info."""
     if target_beads is not None:                       # coarsest nodes of about target_beads beads each
         target = C.shape[0] / target_beads
-    lab, Cc, levels = coarsen(C, target, seed, verbose, keep_levels=True)
+    global FULL_BELOW
+    keep_full = FULL_BELOW
+    FULL_BELOW = max(FULL_BELOW, int(min(finest, C.shape[0] - 1)))   # every level reconstructed needs full aggregated counts
+    try:
+        lab, Cc, levels = coarsen(C, target, seed, verbose, keep_levels=True)
+    finally:
+        FULL_BELOW = keep_full
     diam, sq = _footprint(side, diam, footprint)        # square side, disc + diam, or any polygon (caller units)
     t0 = time.time(); n = C.shape[0] if n_beads is None else n_beads   # beads behind the nodes (level scaling)
     with level_scale(n, Cc.shape[0]):
         Cs = sparsify(Cc)
         best = None
         fa = footprint_aspect(sq)
-        cands = [c for k in range(COARSE_SEEDS) for c in coarse_candidates(Cs, seed + 1000 * k, fa)]
-        select = COARSE_ELONGATED_SELECT if (fa is not None and fa >= COARSE_ASPECT_MIN and COARSE_RANDOM_TRIES) else COARSE_SELECT
-        for k, (name, Ec) in enumerate(cands):        # selection at the coarsest level (seeds and/or random inits)
-            if on_level is not None and k == 0:        # diagnostic hook: coarsest UMAP before accumap
-                on_level(f"{len(levels)} umap", Ec, levels)
-            Yk = np.asarray(cm.reconstruct(Cs, Ec, diam, shared=True, footprint=sq,
-                                           verbose=False, device=device, n_starts=COARSE_STARTS)["receivers"], float)
-            if len(cands) > 1:
-                sc = (density_excess(Yk) if select == "density" else
-                      -cm.log_likelihood(Cs, Yk, diam, shared=True, device=device))
-                if verbose:
-                    print(f"  coarsest {name}: {select} score {sc:.6g}", flush=True)
-            else:
-                sc = 0.0
+        cands = [c for k in range(COARSE_SEEDS) for c in coarse_candidates(Cs, seed + 1000 * k, fa, Cc=Cc, footprint=sq)]
+        poly = sq is not None and not isinstance(sq, str)
+        select = COARSE_ELONGATED_SELECT if (poly and len(cands) > COARSE_SEEDS) else COARSE_SELECT
+        if on_level is not None:                       # diagnostic hook: coarsest UMAP before accumap
+            on_level(f"{len(levels)} umap", cands[0][1], levels)
+        if COARSE_DEVICES and len(cands) > 1:          # candidates in worker processes, one per device
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            ctx = mp.get_context("spawn"); st = _settings_snapshot()
+            pools = [ProcessPoolExecutor(1, mp_context=ctx, initializer=_worker_init, initargs=(st,)) for _ in COARSE_DEVICES]
+            try:
+                futs = [pools[k % len(pools)].submit(_coarse_job, Cs, Ec, diam, sq, COARSE_DEVICES[k % len(pools)], select)
+                        for k, (name, Ec) in enumerate(cands)]
+                scored = [(f.result(), name) for f, (name, _) in zip(futs, cands)]
+            finally:
+                for pl in pools:
+                    pl.shutdown()
+        else:
+            scored = []
+            for name, Ec in cands:
+                Yk = np.asarray(cm.reconstruct(Cs, Ec, diam, shared=True, footprint=sq,
+                                               verbose=False, device=device, n_starts=COARSE_STARTS)["receivers"], float)
+                sc = 0.0 if len(cands) == 1 else (density_excess(Yk) if select == "density" else
+                                                  -cm.log_likelihood(Cs, Yk, diam, shared=True, device=device))
+                scored.append(((sc, Yk), name))
+        for (sc, Yk), name in scored:                  # selection at the coarsest level (seeds and/or random inits)
+            if verbose and len(cands) > 1:
+                print(f"  coarsest {name}: {select} score {sc:.6g}", flush=True)
             if best is None or sc < best[0]:
                 best = (sc, Yk, name)
         Y = best[1]
@@ -385,14 +501,54 @@ def multilevel_layout(C, side=None, target=5000, finest=70000, seed=0, device="c
         Y = prolong(C_lev, levels[lev][0], Y)
         if 0 < lev and C_lev.shape[0] <= finest:       # intermediate level small enough: re-run accumap on it
             t0 = time.time()
-            with level_scale(n, C_lev.shape[0]):
-                Y = np.asarray(cm.reconstruct(sparsify(C_lev), Y, diam, shared=True, footprint=sq, verbose=False, device=device)["receivers"], float)
+            light = LIGHT_ABOVE is not None and C_lev.shape[0] > LIGHT_ABOVE
+            kw = dict(n_passes=1, fit_iters=LIGHT_FIT_ITERS, refine_rounds=LIGHT_REFINE_ROUNDS) if light else {}
+            old_sched = cm.WARP_SCHEDULE
+            if light:                                  # finest warp grid only (the coarser levels fixed the global shape)
+                cm.WARP_SCHEDULE = tuple(LIGHT_WARP_SCHEDULE) if LIGHT_WARP_SCHEDULE else (cm.WARP_SCHEDULE[-1],)
+            try:
+                with level_scale(n, C_lev.shape[0]):
+                    Y = np.asarray(cm.reconstruct(sparsify(C_lev), Y, diam, shared=True, footprint=sq, verbose=False, device=device,
+                                                  **kw)["receivers"], float)
+            finally:
+                cm.WARP_SCHEDULE = old_sched
             if verbose:
-                print(f"  level {lev}: {C_lev.shape[0]:,} nodes reconstructed ({time.time() - t0:.0f} s)", flush=True)
+                print(f"  level {lev}: {C_lev.shape[0]:,} nodes reconstructed{' (light)' if light else ''} ({time.time() - t0:.0f} s)",
+                      flush=True)
             if on_level is not None:
                 on_level(lev, Y, levels)
     Y, n_reloc = relocate_passes(C, Y, sq, verbose)    # misplaced patches (beads) moved next to their well-placed partners
+    Y = spread_stacks(Y, seed=seed, verbose=verbose)    # beads sharing a position (prolonged nodes, relocation medians) spread out
     return Y.astype(np.float32), {"coarse_nodes": int(Cc.shape[0]), "relocated": int(n_reloc)}
+
+
+START_SPREAD = 0.5   # spread_stacks: stacked beads spread uniformly over a disc of this fraction of the distance from their position
+                     # to the nearest other distinct position (0: off). Real eye chart start: 1.44M beads at 97k distinct positions
+                     # (largest stack 2,248) -> crowded near-field cells made the warp >7x slower than on the simulated eye chart
+
+
+def spread_stacks(Y, frac=None, seed=0, verbose=True):
+    """Beads that share an exact position (e.g. all beads of a prolonged coarse node, or beads relocated to the same partner
+    median) spread uniformly over a disc of radius frac x the distance from that position to the nearest other distinct
+    position, so the start has no stacks (crowded cells are slow, and identical positions carry no information)."""
+    from scipy.spatial import cKDTree
+    frac = START_SPREAD if frac is None else frac
+    Y = np.array(Y, float)
+    ok = np.isfinite(Y).all(1)
+    if not frac or ok.sum() < 3:
+        return Y
+    key, inv, cnt = np.unique(np.round(Y[ok], 6), axis=0, return_inverse=True, return_counts=True)
+    inv = inv.ravel()
+    stacked = cnt[inv] > 1
+    if not stacked.any() or len(key) < 2:
+        return Y
+    r = frac * cKDTree(key).query(key, 2)[0][:, 1]   # per distinct position: fraction of its nearest-neighbour distance
+    rng = np.random.default_rng(seed)
+    m = int(stacked.sum()); rad = r[inv[stacked]] * np.sqrt(rng.uniform(0, 1, m)); th = rng.uniform(0, 2 * np.pi, m)
+    Z = Y[ok]; Z[stacked] += np.c_[rad * np.cos(th), rad * np.sin(th)]; Y[ok] = Z
+    if verbose:
+        print(f"  spread_stacks: {m:,} beads at {int((cnt > 1).sum()):,} shared positions spread (largest stack {int(cnt.max()):,})", flush=True)
+    return Y
 
 
 def relocate_passes(C, Y, footprint, verbose=True):

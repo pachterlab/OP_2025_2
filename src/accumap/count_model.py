@@ -114,17 +114,18 @@ FAST_COMPILE = True   # fuse the per-pair likelihood terms with torch.compile on
 FAST_COMPILE_CPU = True   # the same on CPU tensors
 
 
-COMPILE_CACHE_LIMIT = 64   # torch._dynamo recompile limit per function (default 8): past it a function silently runs eager
+COMPILE_CACHE_LIMIT = 256  # torch._dynamo recompile limit per function (default 8): past it a function silently runs eager
                            # for the rest of the process (seen when a multilevel start ran in-process before a large run)
 
 
 _COMPILE_LOCK = threading.Lock()
 
 
-def _maybe_compiled(fn, dynamic=False):
+def _maybe_compiled(fn, dynamic=None):
     """fn, compiled with torch.compile on first use (CUDA, or CPU with FAST_COMPILE_CPU); eager otherwise, and
     eager for good if compilation fails (results agree to floating-point rounding). dynamic=True: one compiled version
-    for all input sizes (functions called on arrays of many sizes, e.g. the cell near sums across multilevel levels)."""
+    for all input sizes; dynamic=False: one version per input shape (never generalized); None: torch's default (static
+    first, generalized after a shape change)."""
     state = {}
 
     def call(*args):
@@ -137,7 +138,10 @@ def _maybe_compiled(fn, dynamic=False):
                     import triton  # noqa: F401  (torch.compile's GPU backend)
                     import torch._dynamo
                     torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, COMPILE_CACHE_LIMIT)
-                    f = torch.compile(fn, dynamic=True) if dynamic else torch.compile(fn)
+                    if CELL_CD_TUNING:
+                        import torch._inductor.config as _ic
+                        _ic.coordinate_descent_tuning = True
+                    f = torch.compile(fn) if dynamic is None else torch.compile(fn, dynamic=dynamic)   # None: torch's default
                 except Exception:
                     f = fn
             elif FAST_COMPILE_CPU and not args[0].is_cuda:
@@ -308,7 +312,8 @@ DENSITY_FLOOR = 1e-8   # density floored at this fraction of its mean before the
 
 
 def _density_floor(rho):
-    return rho.clamp(min=DENSITY_FLOOR * float(rho.detach().mean()))
+    # absolute floor too: a grid with no beads under it (all-zero KDE) gave log(0) -> NaN gradients (U-shape test, 10-23)
+    return rho.clamp(min=max(DENSITY_FLOOR * float(rho.detach().mean()), 1e-30))
 
 
 def density_penalty(P, footprint="disc", posed=None):
@@ -423,6 +428,16 @@ def _is_convex(poly):
     return np.all(cr >= -1e-9) or np.all(cr <= 1e-9)
 
 
+def polygon_centroid(poly):
+    """Area centroid of a simple polygon (shoelace formula). The footprint is posed about the layout's centroid, so it must
+    be centred on its own area centroid: for non-convex outlines (e.g. an L) the vertex mean is far from it."""
+    p = np.asarray(poly, np.float64); x, y = p[:, 0], p[:, 1]; x1, y1 = np.roll(x, -1), np.roll(y, -1)
+    cr = x * y1 - x1 * y; a = cr.sum() / 2.0
+    if abs(a) < 1e-12:
+        return p.mean(0)
+    return np.array([((x + x1) * cr).sum(), ((y + y1) * cr).sum()]) / (6.0 * a)
+
+
 def _pose_polygon(P, poly, frac=None):
     """Pose the footprint polygon on the layout: centred on the layout's centroid, at the rotation where
     POSE_QUANTILE of the beads fit inside the smallest scaled copy of the polygon (the best-aligned
@@ -469,6 +484,13 @@ def _edge_kappa(G, support, h):
     return _kde(G, Y, h)
 
 
+DENSITY_HIGHPASS = None    # polygon footprints: None = the original prior (log density at bandwidths HS about its global mean);
+                           # k = short-range prior: log density at h relative to the same smoothed at k*h, so large-scale density
+                           # variation (e.g. uneven bead recovery) is not forced flat (prototype, eye chart 10-29)
+DENSITY_GLOBAL_FRAC = 0.1  # with DENSITY_HIGHPASS: weight of the remaining large-scale term (log density at k*h about its mean),
+                           # which keeps beads filling the footprint (1 ~ the original prior's large-scale part, 0 = none)
+
+
 def _density_penalty_polygon(P, poly, posed=None):
     """Density penalty inside a known footprint (polygon, internal units, centred), posed on the layout
     (or inside an already posed polygon)."""
@@ -496,7 +518,16 @@ def _density_penalty_polygon(P, poly, posed=None):
             with torch.no_grad():
                 lr_k = torch.log(_edge_kappa(G, support, h))
             lr = lr - lr_k
-        pen = pen + ((lr - lr.mean()) ** 2).sum()
+        if DENSITY_HIGHPASS:                             # short-range prior: log density relative to its own large-scale
+            H = DENSITY_HIGHPASS * h                     # smoothing (bandwidth k*h), so gradual variation goes unpenalized
+            lrH = torch.log(_density_floor(_kde(G, P, H)))
+            if EDGE_CORRECT:
+                with torch.no_grad():
+                    lrH = lrH - torch.log(_edge_kappa(G, support, H))
+            d = lr - lrH
+            pen = pen + ((d - d.mean()) ** 2).sum() + DENSITY_GLOBAL_FRAC * ((lrH - lrH.mean()) ** 2).sum()
+        else:
+            pen = pen + ((lr - lr.mean()) ** 2).sum()
         sds.append(float((rho.std() / rho.mean()).detach()))
         n_ref = len(G) if n_ref is None else n_ref
     if COVERAGE_FRACS:                                 # wide, edge-corrected bandwidths: empty footprint regions far from beads
@@ -732,6 +763,8 @@ MULTI_GPU = None               # with LENGTH_REF_UM set: list of CUDA devices (e
 
 
 _DEV_POOL = None
+PROFILE_DEVICES = False      # diagnostic: accumulate per-device seconds of the warp's observed / near terms in DEVICE_TIMES
+DEVICE_TIMES = {}
 
 
 def _on_devices(work, K):
@@ -831,18 +864,28 @@ class _Counts:
         self.kernel_store = "fp32" if size * 4 <= DENSE_FP32_BYTES else ("fp16" if size * 2 <= DENSE_FP16_BYTES else "chunked")
 
     def _build_parts(self):
-        """MULTI_GPU count shares: rows split into equal-nnz blocks, one per device; each device keeps resident what fits
-        (free memory - MULTI_GPU_RESERVE_GB), the rest of its block is streamed from pinned host memory."""
+        """MULTI_GPU count shares: rows split into one block per device, sized by each device's resident capacity (free
+        memory - MULTI_GPU_RESERVE_GB; eye chart: GPU 0 streamed 0.37 s/step under an equal split while GPU 1 had ~2 GB
+        spare); each device keeps resident what fits, the rest of its block is streamed from pinned host memory."""
         torch = _torch()
         csr = self._csr; K = len(MULTI_GPU)
-        cuts = [0] + [int(np.searchsorted(csr.indptr, csr.nnz * k / K)) for k in range(1, K)] + [csr.shape[0]]
-        self.parts = []                                # each device: resident rows first, the rest (if any) streamed
+        caps = []                                      # resident capacity per device (counts, ~6 bytes each)
         for k in range(K):
             d = torch.device(MULTI_GPU[k])
             free = torch.cuda.mem_get_info(d)[0] + torch.cuda.memory_reserved(d) - torch.cuda.memory_allocated(d)
-            keep = free - MULTI_GPU_RESERVE_GB[0 if d == self.dev else 1] * 1e9
+            caps.append(max(int((free - MULTI_GPU_RESERVE_GB[0 if d == self.dev else 1] * 1e9) // 6), 0))
+        tot = float(sum(caps))                         # shares: in proportion to capacity if everything fits; else each
+        if tot >= csr.nnz and tot > 0:                 # device's capacity plus an equal part of the excess (streamed)
+            share = [csr.nnz * c / tot for c in caps]
+        else:
+            share = [c + (csr.nnz - tot) / K for c in caps]
+        bounds = np.cumsum([0.0] + share)
+        cuts = [0] + [int(np.searchsorted(csr.indptr, bounds[k])) for k in range(1, K)] + [csr.shape[0]]
+        self.parts = []                                # each device: resident rows first, the rest (if any) streamed
+        for k in range(K):
+            d = torch.device(MULTI_GPU[k])
             a = csr.indptr[cuts[k]]
-            cap = max(int(keep // 6), 0)                # ~6 bytes per resident count
+            cap = caps[k]
             split = int(np.searchsorted(csr.indptr, a + cap, side="right")) - 1
             split = min(max(split, cuts[k]), cuts[k + 1])
             if split > cuts[k]:
@@ -1489,6 +1532,28 @@ def _near_cells_on():
     return NEAR_CELLS if NEAR_CELLS is not None else LENGTH_REF_UM is not None
 
 
+CELL_STATIC_COMPILE = False  # True: cell kernels compiled for fixed shapes (one version per padded shape) instead of one shape-generic
+                             # version: the generic reduction kernels were ~7x slower (eye chart near term 3.4 -> 1.8 s per call on
+                             # a fresh compile cache). Padded widths / cell counts follow a geometric ladder (_shape_bucket) so the
+                             # number of distinct shapes stays small
+
+
+CELL_CD_TUNING = False       # True: coordinate-descent tuning of compiled kernels (torch inductor); single-call test on one GPU: eye
+                             # chart near term 3.43 -> 2.48 s; not yet validated in the full warp
+CELL_LADDER_STEPS = 1   # shape ladder steps per doubling (1: powers of two; 4 gave too many distinct shapes: 149 recompiles in 60
+                        # eye-chart warp steps)
+
+
+def _shape_bucket(n, base):
+    """Smallest value >= n on the ladder base * 2^(k / CELL_LADDER_STEPS) (multiples of 8 above 8)."""
+    v = base
+    while v < n:
+        v = int(np.ceil(v * 2 ** (1.0 / CELL_LADDER_STEPS)))
+        if v > 8:
+            v = -(-v // 8) * 8
+    return v
+
+
 class _CellLists:
     """Cell lists as groups of cells of similar size, each padded to its own widths: (R, Rm, S, Sm) per group (see
     _cell_lists). Iterating gives the groups."""
@@ -1533,10 +1598,12 @@ def _cell_lists(X, U, radius):
             j = max(j, i + 1)
             sel = order[i:j]
             rcg, rsg, cnt, st = rc[sel], rs[sel], cnt_all[sel], st_all[sel]
-            maxR = -(-int(rcg.max()) // 32) * 32; ar = torch.arange(maxR, device=X.device)   # widths bucketed (fewer compiled shapes)
+            maxR = (_shape_bucket(int(rcg.max()), 32) if CELL_STATIC_COMPILE else -(-int(rcg.max()) // 32) * 32)   # padded widths
+            ar = torch.arange(maxR, device=X.device)
             R = ox[(rsg[:, None] + ar[None, :]).clamp(max=len(ox) - 1)]; Rm = ar[None, :] < rcg[:, None]
             cum = torch.cumsum(cnt, 1); tot = cum[:, -1]
-            maxS = max(-(-int(tot.max()) // 128) * 128, 128); js = torch.arange(maxS, device=X.device)
+            maxS = _shape_bucket(int(tot.max()), 128) if CELL_STATIC_COMPILE else max(-(-int(tot.max()) // 128) * 128, 128)
+            js = torch.arange(maxS, device=X.device)
             seg = torch.searchsorted(cum, js[None, :].expand(len(sel), maxS).contiguous(), right=True).clamp(max=24)
             within = js[None, :] - (cum - cnt).gather(1, seg)
             S = ou[(st.gather(1, seg) + within).clamp(0, len(ou) - 1)]; Sm = js[None, :] < tot[:, None]
@@ -1572,8 +1639,8 @@ def _cell_cols_eager(X, U, R, Rm, S, Sm, v, tab, c, shared):
     return (_cell_k_eager(X[R], U[S], ok, tab, c) * v[R][:, :, None]).sum(1)
 
 
-_cell_rows = _maybe_compiled(_cell_rows_eager, dynamic=True)
-_cell_cols = _maybe_compiled(_cell_cols_eager, dynamic=True)
+_cell_rows = _maybe_compiled(_cell_rows_eager, dynamic=not CELL_STATIC_COMPILE)
+_cell_cols = _maybe_compiled(_cell_cols_eager, dynamic=not CELL_STATIC_COMPILE)
 
 
 def _cell_kd_eager(Xr, Us, ok, tab):
@@ -1614,8 +1681,8 @@ def _cell_cols_grad_eager(X, U, R, Rm, S, Sm, v, tab, shared, g):
     return coef.sum(2), -coef.sum(1), (go[:, None, :] * k).sum(2)
 
 
-_cell_rows_grad = _maybe_compiled(_cell_rows_grad_eager, dynamic=True)
-_cell_cols_grad = _maybe_compiled(_cell_cols_grad_eager, dynamic=True)
+_cell_rows_grad = _maybe_compiled(_cell_rows_grad_eager, dynamic=not CELL_STATIC_COMPILE)
+_cell_cols_grad = _maybe_compiled(_cell_cols_grad_eager, dynamic=not CELL_STATIC_COMPILE)
 
 
 def _cell_batches(cl):
@@ -1627,10 +1694,24 @@ def _cell_batches(cl):
 
 def _cell_group_batches(R, Rm, S, Sm):
     torch = _torch()
+    if R.shape[1] * S.shape[1] > NEAR_CELL_BATCH and R.shape[1] > 32:
+        # crowded cells (e.g. a collapsed coarse layout): receivers in column chunks so a single cell's batch stays within
+        # NEAR_CELL_BATCH; exact, since every use sums per receiver and per candidate (last chunk padded to full width)
+        w = max(32, (NEAR_CELL_BATCH // S.shape[1]) // 32 * 32)
+        for j in range(0, R.shape[1], w):
+            r, rm = R[:, j:j + w], Rm[:, j:j + w]
+            if r.shape[1] < w:
+                pc = w - r.shape[1]
+                r = torch.cat([r, r[:, :1].expand(-1, pc)], 1)
+                rm = torch.cat([rm, torch.zeros((rm.shape[0], pc), dtype=rm.dtype, device=rm.device)], 1)
+            yield from _cell_group_batches(r, rm, S, Sm)
+        return
     per = max(1, NEAR_CELL_BATCH // (R.shape[1] * S.shape[1]))
+    if CELL_STATIC_COMPILE and len(R) < per:          # short groups: cell count on the ladder (few compiled shapes)
+        per = min(per, _shape_bucket(len(R), 1))
     for j in range(0, len(R), per):
         r, rm, s_, sm = R[j:j + per], Rm[j:j + per], S[j:j + per], Sm[j:j + per]
-        if len(r) < per and len(R) > per:
+        if len(r) < per and (len(R) > per or CELL_STATIC_COMPILE):
             pad = per - len(r)
             r = torch.cat([r, r[:1].expand(pad, -1)]); s_ = torch.cat([s_, s_[:1].expand(pad, -1)])
             rm = torch.cat([rm, torch.zeros((pad, rm.shape[1]), dtype=rm.dtype, device=rm.device)])
@@ -1690,7 +1771,7 @@ def _cell_rows_vg_eager(X, U, R, Rm, S, Sm, w, tab, shared, g):
     return (gw * k).sum(), coef.sum(2), -coef.sum(1)
 
 
-_cell_rows_vg = _maybe_compiled(_cell_rows_vg_eager, dynamic=True)
+_cell_rows_vg = _maybe_compiled(_cell_rows_vg_eager, dynamic=not CELL_STATIC_COMPILE)
 _NEAR_EXP_FN = None
 
 
@@ -1711,18 +1792,28 @@ def _near_exp_fn():
             devs = [torch.device(d) for d in MULTI_GPU] if (MULTI_GPU and X.is_cuda) else [X.device]
             K = len(devs); same = U is X
 
-            def work(k):                                  # several devices: each every K-th cell batch, one thread each
-                d = devs[k]
+            def work(k):                                  # several devices: cell batches balanced by padded size, one thread each
+                d = devs[k]; t_ = time.time()
                 with torch.no_grad(), torch.cuda.device(d) if d.type == "cuda" else contextlib.nullcontext():
                     Xk = X.detach().to(d); Uk = Xk if same else U.detach().to(d)
                     wk, gk, tk = w.to(d), g.to(d), tab.to(d)
                     cl = _cell_lists(Xk, Uk, float(FAST_R2))
                     vk = torch.zeros((), dtype=X.dtype, device=d); gXk, gUk = torch.zeros_like(Xk), torch.zeros_like(Uk)
-                    for b, (r, rm, s_, sm) in enumerate(_cell_batches(cl)):
-                        if b % K != k:
+                    nbat = 0; loads = [0.0] * K
+                    for r, rm, s_, sm in _cell_batches(cl):
+                        # batches dealt to the device with the least padded work so far (same assignment on every device:
+                        # identical cell lists); round-robin gave one device the wider half of every size class (2.5x slower)
+                        dsel = int(np.argmin(loads)); loads[dsel] += float(r.shape[0] * r.shape[1] * s_.shape[1])
+                        if dsel != k:
                             continue
+                        nbat += 1
                         v, dx, du = _cell_rows_vg(Xk, Uk, r, rm, s_, sm, wk, tk, shared, gk)
                         vk = vk + v; gXk.index_add_(0, r[rm], dx[rm]); gUk.index_add_(0, s_[sm], du[sm])
+                if PROFILE_DEVICES:
+                    if d.type == "cuda":
+                        torch.cuda.synchronize(d)
+                    DEVICE_TIMES[("near", str(d))] = DEVICE_TIMES.get(("near", str(d)), 0.0) + time.time() - t_
+                    DEVICE_TIMES[("near batches", str(d))] = DEVICE_TIMES.get(("near batches", str(d)), 0) + nbat
                 return vk, gXk, gUk
             with torch.no_grad():
                 for vk, gXk, gUk in _on_devices(work, K):
@@ -1751,6 +1842,10 @@ def _exp_term(fk, X, U, q, a, tab):
     return (g * fk.row_sums(X, U, w)).sum()
 
 
+NEAR_SUM_X_CHUNK = 2_000_000   # no-gradient near sums over more receivers than this (and receivers != senders) run in chunks
+                               # (real eye chart, SCOPE start: the refinement normalizer's cell lists exceeded GPU memory)
+
+
 def _near_sum_cells(X, U, w, tab, c, shared, transpose=False):
     """Near-field sums without a stored pair list (exactly the stored-pair sums at radius FAST_R2):
     transpose=False: s_b = sum_o w_o K(d_bo)(1 - S(d_bo)) over receivers X; True: t_o = sum_b w_b K (1 - S) over U.
@@ -1758,6 +1853,11 @@ def _near_sum_cells(X, U, w, tab, c, shared, transpose=False):
     torch = _torch()
     if torch.is_grad_enabled() and (X.requires_grad or U.requires_grad or w.requires_grad):
         return _near_cells_fn().apply(X, U, w, tab, c, shared, transpose)
+    if not transpose and not shared and len(X) > NEAR_SUM_X_CHUNK:
+        # many receivers (e.g. the refinement normalizer's grid points): in chunks, so the cell lists stay bounded (each
+        # receiver's sum is independent; grid points come in spatial order, so chunks are compact strips)
+        return torch.cat([_near_sum_cells(X[i:i + NEAR_SUM_X_CHUNK], U, w, tab, c, shared)
+                          for i in range(0, len(X), NEAR_SUM_X_CHUNK)])
     cl = _cell_lists(X.detach(), U.detach(), float(FAST_R2))
     out = torch.zeros(len(U) if transpose else len(X), device=X.device, dtype=w.dtype)
     f = _cell_cols if transpose else _cell_rows
@@ -1889,7 +1989,7 @@ def _obs_fn():
                     devs = list(dict.fromkeys(p.dev for p in cnt.parts))
 
                     def work(k):
-                        d = devs[k]
+                        d = devs[k]; t_ = time.time()
                         with torch.no_grad(), torch.cuda.device(d):
                             Xk = X.to(d); Uk = Xk if same else U.to(d)
                             tk = tab.to(d); ck = torch.as_tensor(c, device=d)
@@ -1899,6 +1999,8 @@ def _obs_fn():
                                     vv, g = _obs_vg(Xk, Uk, r, o, v, tk, ck)
                                     vk = vk + vv; gXk.index_add_(0, r, g); gUk.index_add_(0, o, -g)
                             torch.cuda.synchronize(d)
+                        if PROFILE_DEVICES:
+                            DEVICE_TIMES[("observed", str(d))] = DEVICE_TIMES.get(("observed", str(d)), 0.0) + time.time() - t_
                         return vk, gXk, gUk
                     for vk, gXk, gUk in _on_devices(work, len(devs)):
                         val = val + vk.to(X.device); gX += gXk.to(X.device); gU += gUk.to(X.device)
@@ -2091,12 +2193,21 @@ class _RowSubset:
         self.n_r, self.n_o, self.shared, self.sel, self.host = len(sel), cnt.n_o, cnt.shared, sel, False
 
 
+KFIT_PAIR_BUDGET = 60_000_000   # kernel fit: if the layout's near pairs (upper bound from the cell lists) exceed this, fit on a
+                                # proportionally smaller random subset of receivers (normal layouts are far below it)
+
+
 def fit_kernel_fast(X, U, cnt, dev, iters=300, lr=0.05, decay=False):
     """Poisson ML fit of the kernel, c, a, q with positions fixed, over ALL receivers and senders (or a random
     subset of receivers, KFIT_ROWS): observed term over nonzero pairs, expected term via near pairs + far-field
     mesh (the kernel image is re-transformed every step, differentiably)."""
     torch = _torch()
     k = KFIT_ROWS if KFIT_ROWS is not None else (KFIT_ROWS_LARGE if LENGTH_REF_UM is not None else None)
+    if KFIT_PAIR_BUDGET and WIDTH is None and X.is_cuda:   # crowded (e.g. collapsed or folded) layouts: near pairs can explode
+        with torch.no_grad():
+            bound = sum(float((rm.sum(1) * sm.sum(1)).sum()) for _, rm, _, sm in _cell_lists(X, U, float(FAST_R2)))
+        if bound > KFIT_PAIR_BUDGET:
+            k = min(k or cnt.n_r, max(1000, int(cnt.n_r * KFIT_PAIR_BUDGET / bound)))
     if ((k is not None and cnt.n_r > k) or cnt.host or getattr(cnt, "compact", False)) and WIDTH is None:   # (per-bead widths are indexed by bead: no subset)
         g = torch.Generator(device="cpu").manual_seed(0)        # host-resident counts: device copy of (a subset of) rows
         sel = torch.randperm(cnt.n_r, generator=g)[:min(k or cnt.n_r, cnt.n_r)].sort().values.to(dev)
@@ -2676,6 +2787,21 @@ def refine_fast(X, U, Csr, cnt, tab, c, q, a):
     return X, U
 
 
+def _drop_diagonal(C):
+    """CSR copy of a square sparse matrix without its diagonal (self pairs), vectorized (the LIL round trip used before
+    was slow and memory-hungry at ~1e9 nonzeros)."""
+    import scipy.sparse as sp
+    C = sp.csr_matrix(C)
+    rows = np.repeat(np.arange(C.shape[0]), np.diff(C.indptr))
+    keep = rows != C.indices
+    if keep.all():
+        return C
+    indptr = np.concatenate([[0], np.cumsum(np.bincount(rows[keep], minlength=C.shape[0]))])
+    out = sp.csr_matrix((C.data[keep], C.indices[keep], indptr), shape=C.shape)
+    out.eliminate_zeros()
+    return out
+
+
 # ------------------------------------------------------------ public --
 
 def rescale_to_diameter(P, diameter):
@@ -2862,7 +2988,7 @@ def _reconstruct_general(Csr, receivers_init, array_diameter, phi, lam, device, 
     rs, cs = np.asarray(Csr.sum(1)).ravel(), np.asarray(Csr.sum(0)).ravel()
     if shared:
         assert Csr.shape[0] == Csr.shape[1], "shared=True needs a square bead-by-bead matrix"
-        Csr = Csr.tolil(); Csr.setdiag(0); Csr = Csr.tocsr(); Csr.eliminate_zeros()
+        Csr = _drop_diagonal(Csr)
         r_ok = o_ok = (rs > 0) | (cs > 0)
     else:
         r_ok, o_ok = rs > 0, cs > 0
@@ -2872,7 +2998,7 @@ def _reconstruct_general(Csr, receivers_init, array_diameter, phi, lam, device, 
     REPEL_SPACING = None if min_spacing is None else float(min_spacing) * s
     if not isinstance(footprint, str):
         fp = np.asarray(footprint, np.float64)
-        footprint = (fp - fp.mean(0)) * s
+        footprint = (fp - polygon_centroid(fp)) * s
     Xi = rescale_to_diameter(np.asarray(receivers_init)[r_ok], REF_DIAMETER)
     Ui = Xi if shared else _senders_from_receivers_sparse(Cf.tocsc(), Xi)
     X0 = torch.tensor(Xi, device=dev)
@@ -3059,7 +3185,7 @@ def _log_likelihood_impl(counts, receivers, array_diameter, senders=None, shared
     s = REF_DIAMETER / float(array_diameter)
     C = sp.csr_matrix(counts, dtype=np.float32)
     if shared:
-        C = C.tolil(); C.setdiag(0); C = C.tocsr(); C.eliminate_zeros()
+        C = _drop_diagonal(C)
         ok = (np.asarray(C.sum(1)).ravel() > 0) | (np.asarray(C.sum(0)).ravel() > 0)
         r_ok = o_ok = ok & np.isfinite(np.asarray(receivers)).all(1)
     else:

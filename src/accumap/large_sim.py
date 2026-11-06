@@ -4,7 +4,8 @@ background c from accumap's fit on SCOPE's real circular array; q, a ~ N(0, 0.4)
 received). Pairs beyond 700 um receive background counts only (partners in proportion to exp(a)). Receivers are processed in
 chunks, so memory stays bounded at millions of beads.
 
-  simulate_shared_array(width_um, height_um, seed) -> (X (n, 2) true positions in um, centred; C (n, n) CSR counts)"""
+  simulate_shared_array(width_um, height_um, seed, polygon=None) -> (X (n, 2) true positions in um, centred; C (n, n) CSR counts)
+  polygon: optional footprint (um, centred on the rectangle's centre); beads outside it are removed before counts are drawn."""
 import time
 import numpy as np
 import scipy.sparse as sp
@@ -18,8 +19,9 @@ def _kernel(d):
     return np.exp(np.interp(np.log(np.clip(d, _KD[0], _KD[-1])), np.log(_KD), np.log(_KV)))
 
 
-def simulate_shared_array(width_um, height_um, seed=0, median_counts=1500.0, verbose=False):
-    """Simulated shared-bead array in a width_um x height_um rectangle (see module docstring) -> (X, C)."""
+def simulate_shared_array(width_um, height_um, seed=0, median_counts=1500.0, verbose=False, polygon=None):
+    """Simulated shared-bead array in a width_um x height_um rectangle, optionally cut to `polygon` (see module docstring)
+    -> (X, C)."""
     from scipy.spatial import cKDTree
     t0 = time.time(); rng = np.random.default_rng(seed)
     sx, sy = float(width_um), float(height_um); side = max(sx, sy)
@@ -29,6 +31,9 @@ def simulate_shared_array(width_um, height_um, seed=0, median_counts=1500.0, ver
     g -= g.mean(0); th = rng.uniform(0, np.pi); R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
     X = g @ R.T + rng.normal(0, 3.0, g.shape)
     X = X[(np.abs(X[:, 0]) <= sx / 2) & (np.abs(X[:, 1]) <= sy / 2)]
+    if polygon is not None:
+        from matplotlib.path import Path
+        X = X[Path(np.asarray(polygon, float)).contains_points(X)]
     X = X[np.lexsort((X[:, 0], np.floor(X[:, 1] / 500)))]      # spatially coherent chunks (faster tree queries)
     n = len(X)
     q, ab = rng.normal(0, 0.4, n), rng.normal(0, 0.4, n); eq, ea = np.exp(q), np.exp(ab)
@@ -58,6 +63,6 @@ def simulate_shared_array(width_um, height_um, seed=0, median_counts=1500.0, ver
                       shape=(n, n)).tocsr()
     C.setdiag(0); C.eliminate_zeros()
     if verbose:
-        print(f"{n:,} beads in a {sx / 1000:g} x {sy / 1000:g} mm rectangle; {int(C.sum()):,} counts, {C.nnz:,} nonzero "
+        print(f"{n:,} beads in a {sx / 1000:g} x {sy / 1000:g} mm {'rectangle' if polygon is None else 'polygon'}; {int(C.sum()):,} counts, {C.nnz:,} nonzero "
               f"({time.time() - t0:.0f} s)", flush=True)
     return X.astype(np.float32), C
