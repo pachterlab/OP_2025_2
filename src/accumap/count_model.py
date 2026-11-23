@@ -2568,10 +2568,15 @@ def _warp_objective_compiled():
 
 
 def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", verbose=False, t0=None,
-                    schedule=None, iso=None):
+                    schedule=None, iso=None, return_warp=False, prior=None, resample=None):
+    """prior: optional dict(X0=, U0=) of the beads the density and isotropy priors use (default: X0, U0, the beads of the
+    likelihood); warp_stage_subsampled passes all beads here while the likelihood uses the subset (iso then indexes them).
+    resample: optional callable returning the next (X0, U0, cnt) for the likelihood, called every 50 steps (warp_stage_subsampled
+    rotates disjoint bead subsets this way)."""
     torch = _torch()
     dev = X0.device
-    allP = X0 if cnt.shared else torch.cat([X0, U0])
+    PX0, PU0 = (prior["X0"], prior["U0"]) if prior is not None else (X0, U0)
+    allP = PX0 if cnt.shared else torch.cat([PX0, PU0])
     lo = allP.min(0).values - 200; hi = allP.max(0).values + 200
     fk = _Fast(X0, U0, tab, c, cnt.shared)
     a = torch.zeros(cnt.n_o, device=dev)
@@ -2603,7 +2608,9 @@ def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", ver
         warp = _Warp(lo, hi, spacing, dev, init_field=warp)
         opt = torch.optim.Adam([warp.D], lr=lr)
         compiled = (WARP_COMPILE and dev.type == "cuda" and not cnt.shared and not cnt.host and not cnt.compact and fk.nb is not None and isinstance(footprint, str)
-                    and footprint == "disc" and KDE_FFT and not EDGE_CORRECT and ANNEAL <= 0)
+                    and footprint == "disc" and KDE_FFT and not EDGE_CORRECT and ANNEAL <= 0 and prior is None)
+        refresh = WARP_SUBSAMPLE_SWITCH if resample is not None else 50
+        d_sum, d_n = None, 0                          # rotating subsets: warp averaged over the second half of the level
         for it in range(steps):
             if compiled:
                 opt.zero_grad(set_to_none=True)
@@ -2642,7 +2649,7 @@ def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", ver
                 with torch.no_grad():
                     WIDTH_LAM -= WIDTH_LAM.mean()          # only relative widths are identifiable
                 WIDTH = torch.exp(WIDTH_LAM).detach()
-            P = X0 + warp(X0) if cnt.shared else torch.cat([X0 + warp(X0), U0 + warp(U0)])
+            P = PX0 + warp(PX0) if cnt.shared else torch.cat([PX0 + warp(PX0), PU0 + warp(PU0)])
             if not isinstance(footprint, str) and it % 50 == 0:
                 posed = (_pose_polygon(P, footprint),       # footprint pose refreshed every 50 steps
                          _pose_polygon(P, footprint, frac=EDGE_SUPPORT) if EDGE_CORRECT else None)
@@ -2653,8 +2660,8 @@ def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", ver
             else:
                 pen, _ = density_penalty(P, footprint, None if isinstance(footprint, str) else posed)
             if iso is not None:
-                Xc = X0 + warp(X0)
-                Uc = Xc if cnt.shared else U0 + warp(U0)
+                Xc = PX0 + warp(PX0)
+                Uc = Xc if cnt.shared else PU0 + warp(PU0)
                 if it % ISO_REFRESH == 0:
                     iso_w = _iso_weights((0.5 * (Xc[iso["ri"]] + Uc[iso["oi"]])).detach(), lo, hi, dev)
                 pen_iso = isotropy_penalty(Xc, Uc, iso["ri"], iso["oi"], lo, hi, weights=iso_w)
@@ -2662,17 +2669,29 @@ def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", ver
             else:
                 (lam * pen).backward()
             opt.step()
-            if (it + 1) % 50 == 0:
+            if resample is not None and it >= steps // 2:
                 with torch.no_grad():
+                    d_sum = warp.D.detach().clone() if d_sum is None else d_sum + warp.D.detach()
+                    d_n += 1
+            if (it + 1) % refresh == 0:
+                with torch.no_grad():
+                    if resample is not None:            # next bead subset (warp_stage_subsampled): q, a fitted afresh
+                        del fk
+                        cnt = None                      # drop the previous subset's counts before loading the next
+                        X0, U0, cnt = resample()
+                        a = torch.zeros(cnt.n_o, device=dev)
                     X = X0 + warp(X0); U = X if cnt.shared else U0 + warp(U0)
                     fk = _Fast(X, U, tab, c, cnt.shared)
-                    q, a = _ipf_fast(X, U, fk, cnt, a, IPF_WARM_ITERS)
+                    q, a = _ipf_fast(X, U, fk, cnt, a, 30 if resample is not None else IPF_WARM_ITERS)
+        if d_n > 0:                                   # each subset's sampling noise averages out instead of the last one's winning
+            with torch.no_grad():
+                warp.D.copy_(d_sum / d_n)
         if verbose:
             msg = ""
             if iso is not None:
                 with torch.no_grad():
-                    Xc = X0 + warp(X0)
-                    msg = f", isotropy penalty {float(isotropy_penalty(Xc, Xc if cnt.shared else U0 + warp(U0), iso['ri'], iso['oi'], lo, hi)):.2e}"
+                    Xc = PX0 + warp(PX0)
+                    msg = f", isotropy penalty {float(isotropy_penalty(Xc, Xc if cnt.shared else PU0 + warp(PU0), iso['ri'], iso['oi'], lo, hi)):.2e}"
             print(f"  warp grid {spacing}: done ({time.time() - t0:.0f}s){msg}", flush=True)
     with torch.no_grad():
         X = X0 + warp(X0)
@@ -2680,7 +2699,103 @@ def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", ver
         if ANNEAL > 0:      # back to the exact kernel for refinement
             fk = _Fast(X, U, tab0, c, cnt.shared)
             q, a = _ipf_fast(X, U, fk, cnt, a, IPF_WARM_ITERS)
-        return X, U, q, a
+        return (X, U, q, a, warp) if return_warp else (X, U, q, a)
+
+
+WARP_SUBSAMPLE = "auto"       # fast path: the warp-stage likelihood on rotating disjoint subsets of the beads (warp_stage_subsampled;
+                              # each subset's counts are ~frac^2 of the nonzeros), priors and the final q, a on all beads. The warp is
+                              # a smooth field with a few hundred to a few thousand parameters, so a full pass over all counts per Adam
+                              # step is mostly redundant on large arrays. "auto": WARP_SUBSAMPLE_FRAC for arrays with at least
+                              # WARP_SUBSAMPLE_ABOVE beads (shared beads, or receivers + senders), all beads otherwise; a float in
+                              # (0, 1): that fraction always; None: all beads. Small arrays: subsets neither help nor hurt (shared and
+                              # distinct calibrated simulations within run-to-run noise), so they are left on all beads.
+                              # rounds=2, frac 0.5 / 0.25 / all beads (11-23):
+                              #   eye chart (1.44M shared beads, 942M nonzeros): log-likelihood -3.4133 / -3.4153..-3.4169 (3 subset
+                              #     seeds) / -3.4117e9, E-free AUC .865 / ~.84 / .873, 2.0 / 1.1 / 4.3 h;
+                              #   18 mm simulation (553k shared beads): median error 5.6 / 6.0 um, 964 / 741 s (rounds=1: 7.5 / 7.8,
+                              #     all beads 7.4 um in 636 s).
+                              # 0.25 is faster but settles in a worse basin on the eye chart; an all-bead second round after a 0.25
+                              # first round does not recover it (-3.4158).
+WARP_SUBSAMPLE_FRAC = 0.5
+WARP_SUBSAMPLE_ABOVE = 500_000
+WARP_SUBSAMPLE_SWITCH = 25    # warp steps per subset before switching to the next (rotating disjoint subsets)
+
+
+def _warp_subsample_frac(n_beads, fast):
+    if not fast or ANNEAL > 0 or JOINT_WIDTH:        # blurred-kernel levels and per-bead widths: not supported, all beads
+        return None
+    if WARP_SUBSAMPLE == "auto":
+        return WARP_SUBSAMPLE_FRAC if n_beads >= WARP_SUBSAMPLE_ABOVE else None
+    if WARP_SUBSAMPLE is None or float(WARP_SUBSAMPLE) >= 1.0:
+        return None
+    return float(WARP_SUBSAMPLE)
+
+
+def warp_stage_subsampled(X0, U0, cnt, Cf, tab, c, frac, seed, phi=PHI, lam=LAM, footprint="disc", verbose=False, t0=None,
+                          schedule=None, iso=None):
+    """warp_stage_fast with a subsampled LIKELIHOOD. Receivers and senders (shared: beads) are split into k = round(1/frac) disjoint
+    random subsets; the likelihood uses one subset's counts at a time (the counts among its beads, a thinning of the same Poisson
+    model, so kernel and background are unchanged; gradient scaled by k^2 to its all-bead size), switching to the next subset every
+    WARP_SUBSAMPLE_SWITCH steps, and each level's warp is the average over its second half, so the subsets' sampling noise averages
+    out. The density and isotropy priors use ALL beads and contacts (cheap: the warp is evaluated at every bead). The fitted warp is
+    applied to all beads and q, a re-fitted on the full counts. Returns X, U, q, a as warp_stage_fast.
+    18 mm simulation (553k shared beads, true positions known; all beads 7.36 um median error, 636 s): one fixed subset with priors
+    on it 12.6 um; priors on all beads 10.6; rotating subsets 9.4; rotating + averaged 7.8 um in 379 s (rounds=2: 6.0 um, 741 s)."""
+    torch = _torch()
+    t1 = time.time(); dev = X0.device; shared = cnt.shared
+    cnt.release_parts()                                   # warp-only count shares (restored by the caller after refinement)
+    rng = np.random.default_rng(seed)
+    n_r, n_o = Cf.shape
+    k = max(1, int(round(1.0 / frac)))                    # disjoint subsets (folds) of receivers and of senders
+    fr = np.array_split(rng.permutation(n_r), k)
+    fo = fr if shared else np.array_split(rng.permutation(n_o), k)
+    folds = []
+    for R, S in zip(fr, fo):
+        R = np.sort(R); S = R if shared else np.sort(S)
+        Cs = Cf[R][:, S].tocsr()
+        if shared:
+            keep = (np.asarray(Cs.sum(1)).ravel() + np.asarray(Cs.sum(0)).ravel()) > 0
+            R = S = R[keep]; Cs = Cs[keep][:, keep].tocsr()
+        else:
+            kr, ko = np.asarray(Cs.sum(1)).ravel() > 0, np.asarray(Cs.sum(0)).ravel() > 0
+            R, S = R[kr], S[ko]; Cs = Cs[kr][:, ko].tocsr()
+        folds.append((R, S, Cs))
+    state = {"i": -1, "cnt": None}
+
+    def nxt():                                            # next fold's beads and counts (one fold on the devices at a time)
+        state["cnt"] = None
+        if dev.type == "cuda":
+            for d in (MULTI_GPU or [dev]):
+                with torch.cuda.device(torch.device(d)):
+                    torch.cuda.empty_cache()
+        state["i"] = (state["i"] + 1) % len(folds)
+        R, S, Cs = folds[state["i"]]
+        Rt = torch.as_tensor(R, device=dev, dtype=torch.long)
+        Xs = X0[Rt].contiguous(); Us = Xs if shared else U0[torch.as_tensor(S, device=dev, dtype=torch.long)].contiguous()
+        state["cnt"] = _Counts(Cs, dev, shared)
+        return Xs, Us, state["cnt"]
+
+    if verbose:
+        print(f"  warp likelihood on {len(folds)} rotating disjoint subsets (1/{k} each, switched every {WARP_SUBSAMPLE_SWITCH} steps): "
+              f"{len(folds[0][0])} receivers" + ("" if shared else f" x {len(folds[0][1])} senders")
+              + f", {folds[0][2].nnz} nonzero each; priors on all beads ({time.time() - t1:.0f}s setup)", flush=True)
+    _, _, _, _, warp = warp_stage_fast(*nxt(), tab, c, phi=phi / (k * k), lam=lam, footprint=footprint,
+                                       verbose=verbose, t0=t0, schedule=schedule, iso=iso, return_warp=True,
+                                       prior=dict(X0=X0, U0=U0), resample=nxt if len(folds) > 1 else None)
+    state["cnt"] = None
+    del folds
+    if dev.type == "cuda":
+        for d in (MULTI_GPU or [dev]):
+            with torch.cuda.device(torch.device(d)):
+                torch.cuda.empty_cache()
+    with torch.no_grad():
+        X = X0 + warp(X0); U = X if shared else U0 + warp(U0)
+        fk = _Fast(X, U, tab, c, shared)
+        q, a = _ipf_fast(X, U, fk, cnt, torch.zeros(cnt.n_o, device=dev), 30)
+        del fk
+    if verbose:
+        print(f"  warp applied to all beads ({time.time() - t1:.0f}s)", flush=True)
+    return X, U, q, a
 
 
 def _side_ll_fast(Center, Origin, pad, N, Other, w_other, G, tab, c, Zmesh, ZF, self_w=None):
@@ -2832,7 +2947,7 @@ def _reconstruct_impl(counts, receivers_init, array_diameter, phi=PHI, lam=LAM, 
                 fit_rows=6000, seed=0, verbose=True, shared=False, footprint="disc", force_general=False,
                 exact=False, min_spacing=None, repel_weight=None, n_starts=1, fit_iters=300,
                 kernel_fit="steps", anneal=0.0, kernel=None, isotropy=ISO_WEIGHT, iso_center=False, n_passes=2,
-                log_passes=False, refine_rounds="converge"):
+                log_passes=False, refine_rounds="converge", rounds=1):
     """Imaging-free reconstruction from a receiver-by-sender count matrix.
 
     counts          (n_receivers, n_senders) non-negative counts (UMIs); dense array or scipy sparse.
@@ -2862,6 +2977,14 @@ def _reconstruct_impl(counts, receivers_init, array_diameter, phi=PHI, lam=LAM, 
                     integer number of rounds.
     n_passes        number of warp + refinement passes (default 2: the first stage and one second stage); each
                     extra pass repeats the second stage (contacts, isotropy warp, refinement) on the current layout.
+    rounds          number of complete runs (default 1), each started from the previous result: kernel re-fitted, all warp
+                    levels and both stages again. Unlike extra passes, a new round re-fits the coarse warp from the current
+                    layout, which can undo a large-scale twist the first round stops short of (eye chart, 11-18: four starts,
+                    log-likelihood -3.421..-3.432 -> -3.406..-3.411e9 in round 2, right-edge twist of up to 10 deg removed;
+                    a third round added 0.003e9). Not always better: on Hu H4_2 (1.2 cm, 878k receivers, 11-23) a second
+                    round lowered the log-likelihood by 0.75% (-25.43 -> -25.62e7, with and without warp subsets), the
+                    isotropy prior pulling against strong real contact anisotropy. Try 2 on large arrays and keep the round
+                    with the higher log_likelihood (each round returns a complete result).
     iso_center      False (default): the prior assumes transfer is isotropic. True: local anisotropy is measured
                     relative to the array-wide mean, so a uniform directional bias of transfer (as in lattice
                     arrays whose transfer favours one lattice direction) is not mistaken for shear; this also
@@ -2893,7 +3016,7 @@ def _reconstruct_impl(counts, receivers_init, array_diameter, phi=PHI, lam=LAM, 
                   footprint=footprint, force_general=force_general, exact=exact, min_spacing=min_spacing,
                   repel_weight=repel_weight, fit_iters=fit_iters, kernel_fit=kernel_fit, anneal=anneal,
                   isotropy=isotropy, iso_center=iso_center, n_passes=n_passes, log_passes=log_passes,
-                  refine_rounds=refine_rounds)
+                  refine_rounds=refine_rounds, rounds=rounds)
         results, scores = [], []
         for k, E in enumerate(inits):
             R = reconstruct(counts, E, array_diameter, n_starts=1, **kw)
@@ -2905,6 +3028,20 @@ def _reconstruct_impl(counts, receivers_init, array_diameter, phi=PHI, lam=LAM, 
         best = int(np.argmax(scores))
         out = results[best]
         out["start_logliks"], out["chosen_start"] = scores, best
+        return out
+    if rounds > 1:
+        kw = dict(phi=phi, lam=lam, device=device, fit_rows=fit_rows, seed=seed, verbose=verbose, shared=shared,
+                  footprint=footprint, force_general=force_general, exact=exact, min_spacing=min_spacing,
+                  repel_weight=repel_weight, fit_iters=fit_iters, kernel_fit=kernel_fit, anneal=anneal, kernel=kernel,
+                  isotropy=isotropy, iso_center=iso_center, n_passes=n_passes, log_passes=log_passes,
+                  refine_rounds=refine_rounds)
+        out, init = None, receivers_init
+        for k in range(int(rounds)):
+            if verbose:
+                print(f"accumap round {k + 1} of {int(rounds)}", flush=True)
+            out = reconstruct(counts, init, array_diameter, n_starts=1, rounds=1, **kw)
+            init = out["receivers"]
+        out["rounds"] = int(rounds)
         return out
     n_r, n_o = counts.shape
     global REPEL_WEIGHT
@@ -3031,7 +3168,12 @@ def _reconstruct_general(Csr, receivers_init, array_diameter, phi, lam, device, 
     if verbose:
         print(f"  kernel fit on initial layout, background {c:.2e} ({time.time() - t0:.0f}s)", flush=True)
     stage, ref = (warp_stage_fast, refine_fast if FAST_REFINE else refine_general) if fast else (warp_stage_general, refine_general)
-    Xw, Uw, q, a = stage(X0, U0, cnt, tab, c, phi=phi, lam=lam, footprint=footprint, verbose=verbose, t0=t0)
+    frac = _warp_subsample_frac(Cf.shape[0] if shared else Cf.shape[0] + Cf.shape[1], fast)
+    if frac is not None:
+        Xw, Uw, q, a = warp_stage_subsampled(X0, U0, cnt, Cf, tab, c, frac, seed + 1000, phi=phi, lam=lam, footprint=footprint,
+                                             verbose=verbose, t0=t0)
+    else:
+        Xw, Uw, q, a = stage(X0, U0, cnt, tab, c, phi=phi, lam=lam, footprint=footprint, verbose=verbose, t0=t0)
     cnt.release_parts()                        # warp-only count shares off the devices during refinement
     X, U = ref(Xw, Uw, Cf, cnt, tab, c, q, a)
     cnt.restore_parts()
@@ -3067,8 +3209,12 @@ def _reconstruct_general(Csr, receivers_init, array_diameter, phi, lam, device, 
                 P = torch.cat([X, U]) if not shared else X
                 p0 = float(isotropy_penalty(X, X if shared else U, ri, oi, P.min(0).values - 200, P.max(0).values + 200))
             print(f"  isotropy stage: {len(ri)} contacts, weight {isotropy}, penalty before {p0:.2e}", flush=True)
-        Xw, Uw, q, a = warp_stage_fast(X, U, cnt, tab, c, phi=phi, lam=lam, footprint=footprint, verbose=verbose,
-                                       t0=t0, schedule=ISO_SCHEDULE, iso=iso)
+        if frac is not None:
+            Xw, Uw, q, a = warp_stage_subsampled(X, U, cnt, Cf, tab, c, frac, seed + 1001 + _pass, phi=phi, lam=lam,
+                                                 footprint=footprint, verbose=verbose, t0=t0, schedule=ISO_SCHEDULE, iso=iso)
+        else:
+            Xw, Uw, q, a = warp_stage_fast(X, U, cnt, tab, c, phi=phi, lam=lam, footprint=footprint, verbose=verbose,
+                                           t0=t0, schedule=ISO_SCHEDULE, iso=iso)
         cnt.release_parts()                    # warp-only count shares off the devices during refinement
         X, U = ref(Xw, Uw, Cf, cnt, tab, c, q, a)
         cnt.restore_parts()
