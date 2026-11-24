@@ -1609,7 +1609,10 @@ def _cell_lists(X, U, radius):
             S = ou[(st.gather(1, seg) + within).clamp(0, len(ou) - 1)]; Sm = js[None, :] < tot[:, None]
             groups.append((R, Rm, S, Sm))
             i = j
-    return _CellLists(groups)
+    # Largest groups first: with dynamic shapes, torch.compile tunes the shape-generic kernel on the sizes of the first calls, which
+    # were the smallest groups (ascending order). On Hu H4_2 a start whose smallest groups had 1 and 2 cells got a near-term kernel
+    # ~45x slower on the dominant ~10k-cell group (whole warp ~7x slower: 6.4 vs 0.9 s per step, 11-23).
+    return _CellLists(groups[::-1])
 
 
 def _cell_k_eager(Xr, Us, ok, tab, c):
