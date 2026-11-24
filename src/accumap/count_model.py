@@ -2705,20 +2705,23 @@ def warp_stage_fast(X0, U0, cnt, tab, c, phi=PHI, lam=LAM, footprint="disc", ver
         return (X, U, q, a, warp) if return_warp else (X, U, q, a)
 
 
-WARP_SUBSAMPLE = "auto"       # fast path: the warp-stage likelihood on rotating disjoint subsets of the beads (warp_stage_subsampled;
+WARP_SUBSAMPLE = None         # optional fast path: the warp-stage likelihood on rotating disjoint subsets of the beads (warp_stage_subsampled;
                               # each subset's counts are ~frac^2 of the nonzeros), priors and the final q, a on all beads. The warp is
                               # a smooth field with a few hundred to a few thousand parameters, so a full pass over all counts per Adam
                               # step is mostly redundant on large arrays. "auto": WARP_SUBSAMPLE_FRAC for arrays with at least
                               # WARP_SUBSAMPLE_ABOVE beads (shared beads, or receivers + senders), all beads otherwise; a float in
                               # (0, 1): that fraction always; None: all beads. Small arrays: subsets neither help nor hurt (shared and
                               # distinct calibrated simulations within run-to-run noise), so they are left on all beads.
-                              # rounds=2, frac 0.5 / 0.25 / all beads (11-23):
-                              #   eye chart (1.44M shared beads, 942M nonzeros): log-likelihood -3.4133 / -3.4153..-3.4169 (3 subset
-                              #     seeds) / -3.4117e9, E-free AUC .865 / ~.84 / .873, 2.0 / 1.1 / 4.3 h;
-                              #   18 mm simulation (553k shared beads): median error 5.6 / 6.0 um, 964 / 741 s (rounds=1: 7.5 / 7.8,
-                              #     all beads 7.4 um in 636 s).
-                              # 0.25 is faster but settles in a worse basin on the eye chart; an all-bead second round after a 0.25
-                              # first round does not recover it (-3.4158).
+                              # Default None (all beads): once the near-term kernel was tuned on the largest cell groups (_cell_lists,
+                              # 11-23), the all-bead warp is fast enough that subsets save little and cost fit. rounds=2, eye chart
+                              # (1.44M shared beads, 942M nonzeros), two runs each (the second after the kernel fix; the run-to-run
+                              # spread from floating-point order alone is ~0.004e9):
+                              #   all beads: log-likelihood -3.4117 / -3.4084e9, E-free AUC .873 / .870, 2.65 h (4.15 h before the fix);
+                              #   frac 0.5:  -3.4133 / -3.4173e9, E-free AUC .865 / .844, 2.0 h;
+                              #   frac 0.25: -3.4153..-3.4169e9 (3 subset seeds), E-free AUC ~.84, 1.1 h; an all-bead second round
+                              #     after a 0.25 first round does not recover it (-3.4158).
+                              # 18 mm simulation (553k shared beads; timings before the fix): median error, rounds=1, all beads 7.4 um
+                              # in 636 s, frac 0.5 7.5, 0.25 7.8; rounds=2, frac 0.5 5.6 um in 964 s, 0.25 6.0 in 741 s.
 WARP_SUBSAMPLE_FRAC = 0.5
 WARP_SUBSAMPLE_ABOVE = 500_000
 WARP_SUBSAMPLE_SWITCH = 25    # warp steps per subset before switching to the next (rotating disjoint subsets)
@@ -2743,7 +2746,8 @@ def warp_stage_subsampled(X0, U0, cnt, Cf, tab, c, frac, seed, phi=PHI, lam=LAM,
     out. The density and isotropy priors use ALL beads and contacts (cheap: the warp is evaluated at every bead). The fitted warp is
     applied to all beads and q, a re-fitted on the full counts. Returns X, U, q, a as warp_stage_fast.
     18 mm simulation (553k shared beads, true positions known; all beads 7.36 um median error, 636 s): one fixed subset with priors
-    on it 12.6 um; priors on all beads 10.6; rotating subsets 9.4; rotating + averaged 7.8 um in 379 s (rounds=2: 6.0 um, 741 s)."""
+    on it 12.6 um; priors on all beads 10.6; rotating subsets 9.4 (frac 0.25); rotating + averaged 7.8 um in 379 s (rounds=2: 6.0 um,
+    741 s); frac 0.5 7.5 um (rounds=2: 5.6 um, 964 s). Off by default (WARP_SUBSAMPLE): on the eye chart it lowers the fit."""
     torch = _torch()
     t1 = time.time(); dev = X0.device; shared = cnt.shared
     cnt.release_parts()                                   # warp-only count shares (restored by the caller after refinement)
@@ -2986,8 +2990,9 @@ def _reconstruct_impl(counts, receivers_init, array_diameter, phi=PHI, lam=LAM, 
                     log-likelihood -3.421..-3.432 -> -3.406..-3.411e9 in round 2, right-edge twist of up to 10 deg removed;
                     a third round added 0.003e9). Not always better: on Hu H4_2 (1.2 cm, 878k receivers, 11-23) a second
                     round lowered the log-likelihood by 0.75% (-25.43 -> -25.62e7, with and without warp subsets), the
-                    isotropy prior pulling against strong real contact anisotropy. Try 2 on large arrays and keep the round
-                    with the higher log_likelihood (each round returns a complete result).
+                    isotropy prior pulling against strong real contact anisotropy. The round with the highest
+                    log_likelihood is returned (round_logliks, chosen_round in the result), so 2 is safe to try on large
+                    arrays at the cost of the extra round.
     iso_center      False (default): the prior assumes transfer is isotropic. True: local anisotropy is measured
                     relative to the array-wide mean, so a uniform directional bias of transfer (as in lattice
                     arrays whose transfer favours one lattice direction) is not mistaken for shear; this also
@@ -3038,13 +3043,20 @@ def _reconstruct_impl(counts, receivers_init, array_diameter, phi=PHI, lam=LAM, 
                   repel_weight=repel_weight, fit_iters=fit_iters, kernel_fit=kernel_fit, anneal=anneal, kernel=kernel,
                   isotropy=isotropy, iso_center=iso_center, n_passes=n_passes, log_passes=log_passes,
                   refine_rounds=refine_rounds)
-        out, init = None, receivers_init
+        best, scores, init = None, [], receivers_init
         for k in range(int(rounds)):
             if verbose:
                 print(f"accumap round {k + 1} of {int(rounds)}", flush=True)
-            out = reconstruct(counts, init, array_diameter, n_starts=1, rounds=1, **kw)
-            init = out["receivers"]
-        out["rounds"] = int(rounds)
+            R = reconstruct(counts, init, array_diameter, n_starts=1, rounds=1, **kw)
+            scores.append(log_likelihood(counts, R["receivers"], array_diameter,
+                                         senders=None if shared else R["senders"], shared=shared, device=device))
+            if verbose:
+                print(f"  round {k + 1}: log-likelihood {scores[-1]:.6g}", flush=True)
+            if best is None or scores[-1] > scores[best[0]]:
+                best = (k, R)
+            init = R["receivers"]
+        out = best[1]                      # the round that explains the counts best (a later round can be worse: Hu H4_2)
+        out["rounds"], out["round_logliks"], out["chosen_round"] = int(rounds), scores, best[0] + 1
         return out
     n_r, n_o = counts.shape
     global REPEL_WEIGHT
