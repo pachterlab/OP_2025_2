@@ -271,8 +271,53 @@ def _ipf(M, Nr, Ns, a, iters=30):
 
 # --------------------------------------------------------------- warp --
 
+WARP_INTERP = "bicubic"   # warp control-grid interpolation. "bicubic": torch grid_sample (cubic convolution, a = -0.75), which
+                          # does NOT reproduce a linear field: a uniform 1% stretch comes out as 0.75..1.5% stretch rippling at the
+                          # grid period (0.74% density ripple; 3.5% at 5%). On Hu H4_2 every layout carries an axis-aligned density
+                          # ripple at the 400 um level's node spacing (~392 um): 1-1.7% after one round, 2.5-3.5% after two (11-24).
+                          # "catmull-rom": a = -0.5, same 4x4 support, reproduces linear (and quadratic) fields exactly. It
+                          # removes the H4_2 ripple (<0.6%) with the same log-likelihood (-25.429 / -25.422e7 vs -25.426 /
+                          # -25.423), is neutral on simulations (shared 3 x 1.5 mm and calibrated, 2 seeds each, within run-to-run
+                          # noise) and slightly worse on the eye chart (rounds=2: -3.4185e9, E-free AUC .865, vs bicubic -3.4117 /
+                          # -3.4084, .873 / .870), so bicubic stays the default: the ripple is ~1.5 um of displacement.
+_INTERP_A = {"bicubic": -0.75, "catmull-rom": -0.5}
+
+
+def _cubic_weights(t, a):
+    """Cubic-convolution weights for the taps at -1, 0, 1, 2 around fractional position t in [0, 1) (Keys kernel, parameter a)."""
+    def near(x):
+        return ((a + 2) * x - (a + 3)) * x * x + 1
+
+    def far(x):
+        return ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
+    return [far(1 + t), near(t), near(1 - t), far(2 - t)]
+
+
+def _warp_sample(D, P, lo, hi, interp=None):
+    """Displacement at points P (n, 2) from control values D (1, 2, ny, nx) spanning [lo, hi] (align_corners convention,
+    zero outside the grid as grid_sample's default padding)."""
+    torch = _torch()
+    interp = interp or WARP_INTERP
+    if interp == "bicubic":
+        g = 2 * (P - lo) / (hi - lo) - 1
+        return torch.nn.functional.grid_sample(D, g[None, None], mode="bicubic", align_corners=True)[0, :, 0, :].T
+    a = _INTERP_A[interp]
+    ny, nx = D.shape[-2], D.shape[-1]
+    u = (P - lo) / (hi - lo) * torch.tensor([nx - 1, ny - 1], device=P.device, dtype=P.dtype)
+    i0 = torch.floor(u); t = u - i0; i0 = i0.long()
+    Dp = torch.nn.functional.pad(D[0], (2, 2, 2, 2))                      # zero padding, 2 nodes each side
+    wx = torch.stack(_cubic_weights(t[:, 0], a), 1); wy = torch.stack(_cubic_weights(t[:, 1], a), 1)
+    off = torch.arange(-1, 3, device=P.device)
+    ix = (i0[:, :1] + off + 2).clamp(0, nx + 3); iy = (i0[:, 1:] + off + 2).clamp(0, ny + 3)
+    flat = Dp.reshape(2, -1)
+    out = 0
+    for r in range(4):                                                    # row by row: (2, n, 4) at a time
+        out = out + wy[:, r] * (flat[:, iy[:, r:r + 1] * (nx + 4) + ix] * wx).sum(-1)
+    return out.T
+
+
 class _Warp:
-    """Smooth displacement field, bicubic on a regular control grid."""
+    """Smooth displacement field, cubic on a regular control grid (WARP_INTERP)."""
 
     def __init__(self, lo, hi, spacing, dev, init_field=None):
         torch = _torch()
@@ -291,9 +336,7 @@ class _Warp:
 
     def __call__(self, P):
         torch = _torch()
-        g = 2 * (P - self.lo) / (self.hi - self.lo) - 1
-        out = torch.nn.functional.grid_sample(self.D, g[None, None], mode="bicubic", align_corners=True)
-        return out[0, :, 0, :].T
+        return _warp_sample(self.D, P, self.lo, self.hi)
 
 
 def _ll_and_grad(X0, U0, warp, Ct, q, a, tab, c):
@@ -2520,8 +2563,7 @@ def _warp_objective(D, X0, U0, lo, hi, q, a, near, far, rows, cols, vals, tab, c
     torch = _torch()
 
     def warp(P):
-        g = 2 * (P - lo) / (hi - lo) - 1
-        return torch.nn.functional.grid_sample(D, g[None, None], mode="bicubic", align_corners=True)[0, :, 0, :].T
+        return _warp_sample(D, P, lo, hi)
 
     X = X0 + warp(X0)
     U = X if shared else U0 + warp(U0)
@@ -2989,8 +3031,12 @@ def _reconstruct_impl(counts, receivers_init, array_diameter, phi=PHI, lam=LAM, 
                     layout, which can undo a large-scale twist the first round stops short of (eye chart, 11-18: four starts,
                     log-likelihood -3.421..-3.432 -> -3.406..-3.411e9 in round 2, right-edge twist of up to 10 deg removed;
                     a third round added 0.003e9). Not always better: on Hu H4_2 (1.2 cm, 878k receivers, 11-23) a second
-                    round lowered the log-likelihood by 0.75% (-25.43 -> -25.62e7, with and without warp subsets), the
-                    isotropy prior pulling against strong real contact anisotropy. The round with the highest
+                    round lowered the log-likelihood by 0.75% (-25.43 -> -25.62e7, with and without warp subsets). Not the
+                    priors (isotropy 0 / 3e5 / no isotropy stage / density 30: all -25.61..-25.62, 11-24) but mostly the
+                    kernel refitted on the sharper round-1 layout: its contact edge is much steeper (K at 75 um 0.20 vs
+                    0.71); round 1 run with that kernel is as bad (-25.62), round 2 with round 1's kernel -25.50 / -25.50
+                    (two starts), still below round 1. Reusing round 1's kernel is worse on the eye chart (-3.4170e9,
+                    E-free AUC .847 vs refit -3.4117 / -3.4084, .873 / .870), so each round refits. The round with the highest
                     log_likelihood is returned (round_logliks, chosen_round in the result), so 2 is safe to try on large
                     arrays at the cost of the extra round.
     iso_center      False (default): the prior assumes transfer is isotropic. True: local anisotropy is measured
