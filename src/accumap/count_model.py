@@ -3028,22 +3028,18 @@ def _reconstruct_impl(counts, receivers_init, array_diameter, phi=PHI, lam=LAM, 
                     extra pass repeats the second stage (contacts, isotropy warp, refinement) on the current layout.
     rounds          number of complete runs (default 1), each started from the previous result: kernel re-fitted, all warp
                     levels and both stages again. Unlike extra passes, a new round re-fits the coarse warp from the current
-                    layout, which can undo a large-scale twist the first round stops short of (eye chart, 11-18: four starts,
-                    log-likelihood -3.421..-3.432 -> -3.406..-3.411e9 in round 2, right-edge twist of up to 10 deg removed;
-                    a third round added 0.003e9). Not always better: on Hu H4_2 (1.2 cm, 878k receivers, 11-23) a second
-                    round lowered the log-likelihood by 0.75% (-25.43 -> -25.62e7, with and without warp subsets). Not the
-                    priors (isotropy 0 / 3e5 / no isotropy stage / density 30: all -25.61..-25.62, 11-24) but mostly the
-                    kernel refitted on the sharper round-1 layout: its contact edge is much steeper (K at 75 um 0.20 vs
-                    0.71); round 1 run with that kernel is as bad (-25.62), round 2 with round 1's kernel -25.50 / -25.50
-                    (two starts), still below round 1. Reusing round 1's kernel is worse on the eye chart (-3.4170e9,
-                    E-free AUC .847 vs refit -3.4117 / -3.4084, .873 / .870), so each round refits. H4_2 has no ground
-                    truth, and the log-likelihood does not rank rounds by accuracy: on simulations with known positions
-                    (11-25) round 1 had the highest log-likelihood on all four small arrays (shared 3 x 1.5 mm, calibrated
-                    distinct-bead; each refit lowers the background) while round 2 moved the median error by -1.0, +0.8,
-                    +0.0, -0.6 um, and on a 3 x 7.2 mm rectangle rounds 2 and 3 lowered the error (16.9 -> 16.2 -> 15.5 um)
-                    and the log-likelihood. On an 18 mm square round 2 lowered the error 7.4 -> 5.4 um and raised the
-                    log-likelihood. The last round is returned; the result has "round_logliks", one per round, for
-                    reference.
+                    layout, which can undo a large-scale distortion the first round stops short of. The last round is
+                    returned; the result has "round_logliks", one per round, for reference only: the log-likelihood does
+                    not rank rounds by accuracy (each round refits the kernel and background on a sharper layout).
+                    Recommended: 2 for large arrays. Simulations with known positions (11-25), median error by round 1/2/3:
+                    Hu-design distinct-bead 12 mm (878k x 207k, H4_2 depth) 20.4 / 16.5 / 16.2 um, log-likelihood 1.0%
+                    LOWER after round 2; 6 mm (220k x 52k) 12.1 / 11.1 / 10.9 um; shared 18 mm square 7.4 / 5.4 / 5.3 um;
+                    shared 3 x 7.2 mm 16.9 / 16.2 / 15.5 um. On small arrays (shared 3 x 1.5 mm, calibrated distinct-bead
+                    3 mm) round 2 changed the median error by -1.0 to +0.8 um. Real arrays: eye chart (11-18, four starts)
+                    log-likelihood -3.421..-3.432 -> -3.406..-3.411e9, right-edge twist of up to 10 deg removed; Hu H4_2
+                    (no ground truth) log-likelihood -25.43 -> -25.62e7 (-0.75%, like the 12 mm simulation), mostly from
+                    the kernel refitted on the sharper round-1 layout (K at 75 um 0.20 vs 0.71). Reusing round 1's kernel
+                    was worse on the eye chart (-3.4170e9, E-free AUC .847 vs .873 / .870), so each round refits.
     iso_center      False (default): the prior assumes transfer is isotropic. True: local anisotropy is measured
                     relative to the array-wide mean, so a uniform directional bias of transfer (as in lattice
                     arrays whose transfer favours one lattice direction) is not mistaken for shear; this also
