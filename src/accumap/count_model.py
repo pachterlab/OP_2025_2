@@ -3036,9 +3036,14 @@ def _reconstruct_impl(counts, receivers_init, array_diameter, phi=PHI, lam=LAM, 
                     kernel refitted on the sharper round-1 layout: its contact edge is much steeper (K at 75 um 0.20 vs
                     0.71); round 1 run with that kernel is as bad (-25.62), round 2 with round 1's kernel -25.50 / -25.50
                     (two starts), still below round 1. Reusing round 1's kernel is worse on the eye chart (-3.4170e9,
-                    E-free AUC .847 vs refit -3.4117 / -3.4084, .873 / .870), so each round refits. The round with the highest
-                    log_likelihood is returned (round_logliks, chosen_round in the result), so 2 is safe to try on large
-                    arrays at the cost of the extra round.
+                    E-free AUC .847 vs refit -3.4117 / -3.4084, .873 / .870), so each round refits. H4_2 has no ground
+                    truth, and the log-likelihood does not rank rounds by accuracy: on simulations with known positions
+                    (11-25) round 1 had the highest log-likelihood on all four small arrays (shared 3 x 1.5 mm, calibrated
+                    distinct-bead; each refit lowers the background) while round 2 moved the median error by -1.0, +0.8,
+                    +0.0, -0.6 um, and on a 3 x 7.2 mm rectangle rounds 2 and 3 lowered the error (16.9 -> 16.2 -> 15.5 um)
+                    and the log-likelihood. On an 18 mm square round 2 lowered the error 7.4 -> 5.4 um and raised the
+                    log-likelihood. The last round is returned; the result has "round_logliks", one per round, for
+                    reference.
     iso_center      False (default): the prior assumes transfer is isotropic. True: local anisotropy is measured
                     relative to the array-wide mean, so a uniform directional bias of transfer (as in lattice
                     arrays whose transfer favours one lattice direction) is not mistaken for shear; this also
@@ -3089,7 +3094,7 @@ def _reconstruct_impl(counts, receivers_init, array_diameter, phi=PHI, lam=LAM, 
                   repel_weight=repel_weight, fit_iters=fit_iters, kernel_fit=kernel_fit, anneal=anneal, kernel=kernel,
                   isotropy=isotropy, iso_center=iso_center, n_passes=n_passes, log_passes=log_passes,
                   refine_rounds=refine_rounds)
-        best, scores, init = None, [], receivers_init
+        scores, init = [], receivers_init
         for k in range(int(rounds)):
             if verbose:
                 print(f"accumap round {k + 1} of {int(rounds)}", flush=True)
@@ -3098,12 +3103,9 @@ def _reconstruct_impl(counts, receivers_init, array_diameter, phi=PHI, lam=LAM, 
                                          senders=None if shared else R["senders"], shared=shared, device=device))
             if verbose:
                 print(f"  round {k + 1}: log-likelihood {scores[-1]:.6g}", flush=True)
-            if best is None or scores[-1] > scores[best[0]]:
-                best = (k, R)
             init = R["receivers"]
-        out = best[1]                      # the round that explains the counts best (a later round can be worse: Hu H4_2)
-        out["rounds"], out["round_logliks"], out["chosen_round"] = int(rounds), scores, best[0] + 1
-        return out
+        R["rounds"], R["round_logliks"] = int(rounds), scores      # last round (log-likelihood does not rank rounds)
+        return R
     n_r, n_o = counts.shape
     global REPEL_WEIGHT
     if repel_weight is not None:
